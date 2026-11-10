@@ -221,12 +221,26 @@ Results include scroll latency distributions, file coverage, and per-file byte,
 line-count, and line-size statistics. See the
 [scroll measurement boundary and options](measurement/README.md#repository-scroll-benchmark).
 
+Measure literal search through the first result frame, with generated inputs at
+known byte distances and controlled editor-buffer residency:
+
+```sh
+zig build benchmark-search -Doptimize=ReleaseSafe -- --repetitions 30
+```
+
+The suite reports median, p95, minimum, and maximum latency for visible and
+offscreen hits, loaded and unloaded destinations, many-file traversal, wrapping,
+full misses, and destination size/line shape. It measures search completion and
+frame generation without terminal display or interaction-responsiveness metrics.
+See the [search measurement boundary and scenarios](measurement/README.md#search-benchmark).
+
 ## Check
 
 ```sh
 zig build test
 zig build test-benchmark
 zig build test-scroll
+zig build test-search
 python3 tests/pty_smoke.py
 zig fmt --check build.zig src measurement
 ```

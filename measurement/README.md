@@ -239,3 +239,92 @@ records. Expected file skips are reported separately from runner failures.
 Run `zig build test-scroll` for end-to-end traversal, statistics, read-only input,
 and result-path checks. The runner's Zig correctness tests are part of
 `zig build test`. Neither test target enforces timing thresholds.
+
+## Search benchmark
+
+```sh
+zig build benchmark-search -Doptimize=ReleaseSafe -- --repetitions 30
+zig build benchmark-search -Doptimize=ReleaseSafe -- --list
+zig build benchmark-search -Doptimize=ReleaseSafe -- --scenario distance/
+zig build benchmark-search -Doptimize=ReleaseSafe -- --scenario readiness/ --scenario files/
+```
+
+The headless worker uses the production editor's literal search, background
+worker, result adoption, cursor positioning, and `renderFrame`. Each measured
+interval begins immediately before submitting Enter to a populated `/` prompt
+and ends after search completion and generation of the first result frame. On
+a miss this is the frame reporting `Pattern not found`. Destination loading,
+line/display preparation, and frame generation are included. The frame can still
+contain ordinary asynchronous filler for neighboring files; the matched text and
+cursor destination must be ready.
+
+Fixture generation, discovery, loading and positioning the initial file,
+settling the initial viewport, optional target preloading, query entry,
+validation, and JSON output are outside the interval. There is no terminal I/O,
+terminal display, or measurement of interaction or cancellation responsiveness.
+The headless loop services production editor ticks with `Thread.yield`, without
+the terminal loop's polling delay or intermediate redraws. Results describe this
+headless execution boundary, not actual key-to-screen latency in a terminal.
+
+Every repetition creates a fresh workspace and editor. The origin file is
+resident; a separately preloaded target is resident only in the designated case.
+The worker records actual target residency immediately before submission, and
+the runner verifies it against the scenario. Visibility is checked against the
+initial frame using the generated unique literal. There are no discarded
+warmups. The OS cache is uncontrolled and fixture generation/inventory can warm
+it: **unloaded means absent from the editor's buffer cache, not cold disk**.
+
+### Scenarios and distance
+
+All fixtures contain printable ASCII with LF newlines and use the same literal,
+`TOME_SEARCH_NEEDLE`, planted once at an exact byte offset (or omitted for a
+miss). Ordinary lines contain 63 content bytes followed by LF. The viewport is
+40 rows by 120 columns. Each scenario has its own temporary directory, deleted
+after its repetitions; configuration and results stay outside that workspace.
+
+| Family | What changes and what stays fixed |
+| --- | --- |
+| `distance/` | 64 B (visible), 4 KiB (offscreen), 64 KiB, 1, 8, and 32 MiB before the match; same 64 MiB resident file |
+| `extent/` | Match near the end of a 64 MiB file, sole match at the cursor requiring a complete wrap, or full-pass miss; resident origin |
+| `readiness/` | Resident versus unloaded 8 MiB destination, with the same 1 MiB search distance and 8 KiB origin file |
+| `files/` | One versus 512 intervening unloaded files; same 8 MiB distance, total bytes, and 8 KiB origin/destination files |
+| `shape/` | Compared with `readiness/unloaded`: an 8 MiB destination consisting of one long line, or a 64 MiB destination with ordinary lines; same 1 MiB distance |
+
+`search_distance_bytes` counts content bytes before the matching start in the
+forward traversal, beginning after the cursor. A match at the next byte has
+distance zero. A sole match at the cursor has distance `traversal_bytes - 1`
+because search wraps. Distances include newline bytes and exclude virtual file
+separators. They describe fixture positions, **not measured bytes examined or
+physical I/O**; chunk reads, projection preparation, and destination loading can
+process additional bytes. Misses have null match distance and boundary count;
+`traversal_bytes` records the whole workspace size for all cases.
+
+Records also include file boundaries crossed before the match, destination file
+size, matching-line length, and byte offset within that line. The many-file pair
+has two versus 513 boundaries before the match: origin, intervening bodies, and
+destination are separate files in both cases, keeping residency comparable.
+
+### Validation and results
+
+The worker verifies the exact destination and matching bytes, expected wrapping
+message, and generated frame. A miss must leave the cursor in place and report
+complete absence. Skipped files, partial coverage, search failures, wrong
+destinations, and timeouts fail the run instead of becoming fast successes. The
+runner additionally checks every sample's residency, visibility, discovery
+count, iteration, and outcome. Each search and initial viewport setup has a
+30-second failure guard; this is not a performance target.
+
+The default is 30 samples per scenario. Console summaries report median, nearest
+rank p95, minimum, and maximum in milliseconds. No performance thresholds are
+enforced. Raw samples and summaries are retained in ignored
+`measurement/results/search-<UTC>.jsonl`; `--output PATH` selects a new file and
+refuses to overwrite an existing one.
+
+JSONL includes run/build/machine/cache metadata, scenario configurations, fixture
+sizes and SHA-256 hashes, validated samples, summaries, and a final `run_end`
+record. A report without `run_end.status: complete` is not a successful suite.
+Compare matching builds, fixture versions, viewport sizes, and cache conditions.
+
+Run `zig build test-search` for search order, wrap/miss, residency, rejected
+incorrect results, fixture-distance checks, and orchestration tests. Zig worker
+correctness tests also run under `zig build test`.
