@@ -1,2 +1,4 @@
 .zig-cache/
 zig-out/
+measurement/results/
+__pycache__/

@@ -158,19 +158,32 @@ Discovery and result reporting are outside the interval. This measures complete
 file readiness, rather than readiness of an entire viewport. The reusable harness
 also supports requests against an existing workspace, distinguishing buffer hits,
 loads, and remembered load failures. It does not control the OS file cache.
-There are no benchmark scenarios, statistical summaries, or performance thresholds
-yet. See [the measurement contract and usage](measurement/README.md).
+
+Run generated benchmark scenarios with Python 3.10 or later:
+
+```sh
+zig build benchmark -Doptimize=ReleaseSafe -- --repetitions 30
+```
+
+The suite covers file sizes through 64 MiB, extreme line lengths and counts,
+newline and UTF-8 variants, file-limit boundaries, and cache pressure. Inputs are
+generated in temporary directories and deleted after each scenario. It prints
+median/minimum/maximum timings and retains samples and reproducibility metadata
+in ignored `measurement/results/*.jsonl` files. There are no performance
+thresholds. See [the measurement contract and usage](measurement/README.md).
 
 ## Check
 
 ```sh
 zig build test
+zig build test-benchmark
 python3 tests/pty_smoke.py
 zig fmt --check build.zig src measurement
 ```
 
-The Python script uses only Python's standard library and drives the built binary
-through a pseudo-terminal. Python is needed only for these integration tests.
+The Python scripts use only the standard library. The benchmark suite and its
+tests require Python 3.10 or later; `pty_smoke.py` drives the built editor through
+a pseudo-terminal. Python is not needed to build or run the editor.
 Tests cover editing, visual selections, yank and paste, UTF-8, CRLF, save
 conflicts, directory ordering, file navigation and looping, workspace writes,
 resizing, and terminal restoration. Use
