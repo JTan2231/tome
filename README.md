@@ -172,11 +172,24 @@ median/minimum/maximum timings and retains samples and reproducibility metadata
 in ignored `measurement/results/*.jsonl` files. There are no performance
 thresholds. See [the measurement contract and usage](measurement/README.md).
 
+Measure scrolling through a real repository with the editor's Page Down and
+frame-generation code, without opening a terminal:
+
+```sh
+zig build benchmark-scroll -Doptimize=ReleaseSafe -- ~/swift/suwa
+```
+
+The default traverses the workspace once; `--steps 1000` sets a fixed load.
+Results include scroll latency distributions, file coverage, and per-file byte,
+line-count, and line-size statistics. See the
+[scroll measurement boundary and options](measurement/README.md#repository-scroll-benchmark).
+
 ## Check
 
 ```sh
 zig build test
 zig build test-benchmark
+zig build test-scroll
 python3 tests/pty_smoke.py
 zig fmt --check build.zig src measurement
 ```

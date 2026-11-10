@@ -67,8 +67,31 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| benchmark.addArgs(args);
     b.step("benchmark", "Run generated file readiness scenarios (requires Python 3)").dependOn(&benchmark.step);
 
+    const editor = b.createModule(.{
+        .root_source_file = b.path("src/editor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "content", .module = content }},
+    });
+    const scroll_module = b.createModule(.{
+        .root_source_file = b.path("measurement/scroll.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "content", .module = content },
+            .{ .name = "editor", .module = editor },
+        },
+    });
+    const scroll_exe = b.addExecutable(.{ .name = "tome-scroll", .root_module = scroll_module });
+    const scroll = b.addSystemCommand(&.{"python3"});
+    scroll.addFileArg(b.path("measurement/scroll.py"));
+    scroll.addArg("--binary");
+    scroll.addArtifactArg(scroll_exe);
+    if (b.args) |args| scroll.addArgs(args);
+    b.step("benchmark-scroll", "Measure headless scrolling through a repository (requires Python 3)").dependOn(&scroll.step);
+
     const test_step = b.step("test", "Run content, editor, and measurement correctness tests");
-    for ([_]*std.Build.Module{ content, app, measurement, benchmark_module }) |module| {
+    for ([_]*std.Build.Module{ content, app, measurement, benchmark_module, scroll_module }) |module| {
         const unit_tests = b.addTest(.{ .root_module = module });
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
@@ -81,4 +104,9 @@ pub fn build(b: *std.Build) void {
     const benchmark_test_step = b.step("test-benchmark", "Test fixture generation and benchmark orchestration (requires Python 3)");
     benchmark_test_step.dependOn(&fixture_tests.step);
     benchmark_test_step.dependOn(&benchmark_tests.step);
+
+    const scroll_tests = b.addSystemCommand(&.{"python3"});
+    scroll_tests.addFileArg(b.path("measurement/test_scroll.py"));
+    scroll_tests.addArtifactArg(scroll_exe);
+    b.step("test-scroll", "Test repository scrolling measurements (requires Python 3)").dependOn(&scroll_tests.step);
 }

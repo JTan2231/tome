@@ -1,7 +1,9 @@
-# File readiness measurement harness
+# Performance measurement harness
 
-This area measures one file request through the same `Workspace.ensure` boundary
-the editor uses. It has no dependency on the editor, renderer, or terminal.
+The file-readiness harness measures one file request through the same
+`Workspace.ensure` boundary the editor uses. It has no dependency on the editor,
+renderer, or terminal. The [repository scroll benchmark](#repository-scroll-benchmark)
+also exercises the editor's navigation and frame generation under sequential load.
 
 ```sh
 zig build measure -Doptimize=ReleaseSafe -- path/to/file
@@ -145,3 +147,95 @@ The JSONL stream contains:
 Run `zig build test` for the Zig tests and `zig build test-benchmark` for fixture
 and orchestration checks. Tests verify outcomes and metadata without timing
 thresholds.
+
+## Repository scroll benchmark
+
+Point the headless runner at an existing folder (Python 3.10 or later):
+
+```sh
+zig build benchmark-scroll -Doptimize=ReleaseSafe -- ~/swift/suwa
+zig build benchmark-scroll -Doptimize=ReleaseSafe -- ~/swift/suwa --steps 1000
+zig build benchmark-scroll -Doptimize=ReleaseSafe -- ~/swift/suwa --rows 50 --cols 160
+```
+
+The default sends Page Down until the first wrap or the end of a short workspace.
+The final event includes the wrap into earlier content, or the stationary event
+that detects the end. `--steps N` sends exactly N events, including repeated
+circuits when applicable. An empty or entirely unreadable workspace has zero
+events in the default mode. The viewport defaults to 40 rows by 120 columns;
+the editor reserves two rows for status and commands.
+
+The worker uses production directory discovery, `Editor.initWorkspace`,
+`Editor.handle(.page_down)`, and `Editor.renderFrame`. The interactive terminal
+loop calls the same frame method. Each scroll interval includes navigation,
+lazy file loading, cache eviction, viewport traversal, width calculation, and
+ANSI frame generation. It ends before terminal output. No terminal opens and
+no input file is edited or saved. Unreadable and oversized files follow the
+editor's skip behavior and appear as failed files in the report.
+
+Discovery and startup-to-first-frame have separate timings. Every subsequent
+sample covers one key plus one complete frame. Events run sequentially without
+human pauses. JSON serialization, result writing, and inventory work are outside
+these intervals; reporting between events still adds process overhead. The
+worker's wall time includes process startup, discovery, and reporting, while
+the scroll total sums only the measured event intervals. This measures editor
+work under sustained scrolling, not end-to-end terminal latency or displayed FPS.
+
+The run starts with a fresh application workspace and retains the normal cache
+policy throughout. No warm-up is discarded. The operating system's file cache
+is uncontrolled. Repeated invocations may benefit from previous reads, including
+the previous run's inventory. Use matching builds and viewport dimensions when
+comparing runs.
+
+Discovery includes hidden and ignored regular files, skips `.git` directories
+and symlinks, and uses the editor's directories-first ordering. In particular,
+Suwa's `.local` databases and generated data are part of this workload. A fixed
+step count can finish before reaching source files. Coverage reports the number
+of files ever loaded, failed, and unvisited. Loaded includes viewport prefetch;
+it does not mean the cursor visited every line or that the buffer remains cached.
+
+### Statistics and results
+
+The console reports total, median, p95 (nearest rank), and maximum elapsed time,
+plus the number of events exceeding 16.67 ms. This reference interval is a useful
+way to count slow events; it is not an enforced performance threshold. The report
+also shows the largest files and slowest events. An event's destination file is
+context, not attribution: that event can cross and load several files.
+
+After the worker exits, the runner reads the discovered files to collect:
+
+- Per-file bytes, line count, maximum and mean line length in content bytes,
+  SHA-256, and modification time.
+- Per-file and aggregate line-size counts: empty, 1–80, 81–256, 257–1,024,
+  1,025–4,096, 4,097–65,536, and over 65,536 content bytes.
+- Repository byte and line totals, file coverage, load errors, and files for
+  which inventory could not collect line statistics.
+
+Line count is one plus the number of LF bytes, including the trailing empty
+line after a final LF and one line for an empty file. Line lengths exclude LF
+and its preceding CR; they retain other bytes and are not Unicode character or
+display-column counts. Binary files follow these same byte rules. Files larger
+than the production 64 MiB limit retain their size but have no line statistics.
+Statistics are a post-run snapshot, separate from the measured workload. The
+report flags files that change during inventory or whose line count differs
+from the last count observed during scrolling. It cannot detect every change
+made by another process during a run.
+
+Results default to ignored `measurement/results/scroll-<UTC>.jsonl` files.
+`--output PATH` selects a new result file; existing files are never overwritten.
+Results must be outside the target tree so that discovery does not include the
+growing report. When the default directory is inside the target, results use
+`tome-measurements` in the system temporary directory instead.
+
+JSONL records include `run` (revision, machine, workload), `worker` (build and
+discovery), `sample` (startup or scroll timing and cursor position),
+`catalog_file` (the worker's discovered paths and observed line counts),
+`complete` (worker coverage and stop reason), `worker_wall`, `summary`,
+`slow_frame`, `file` (post-run per-file statistics), and `repository_summary`.
+The final `run_end` must have `status: complete` for a completed report. Setup,
+worker, or reporting failures produce a failed run and preserve available raw
+records. Expected file skips are reported separately from runner failures.
+
+Run `zig build test-scroll` for end-to-end traversal, statistics, read-only input,
+and result-path checks. The runner's Zig correctness tests are part of
+`zig build test`. Neither test target enforces timing thresholds.

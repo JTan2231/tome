@@ -100,7 +100,7 @@ pub const Editor = struct {
         }
     }
 
-    fn handle(self: *Editor, key: terminal.Key) !bool {
+    pub fn handle(self: *Editor, key: terminal.Key) !bool {
         if (key == .tick) return false;
         // A bracketed paste is one movement for viewport purposes. Avoid
         // rescanning the growing buffer for every byte of a large paste.
@@ -602,12 +602,17 @@ pub const Editor = struct {
     }
 
     fn draw(self: *Editor, tty: *terminal.Terminal, size: terminal.Size) !void {
+        try tty.writeAll(try self.renderFrame(size));
+    }
+
+    /// Prepare the same complete frame used by the terminal loop, without I/O.
+    /// The returned bytes are borrowed until the next frame or deinit.
+    pub fn renderFrame(self: *Editor, size: terminal.Size) ![]const u8 {
         self.frame.clearRetainingCapacity();
         try self.append("\x1b[?2026h\x1b[?25l\x1b[0m");
         if (size.rows < 3 or size.cols < 2) {
             try self.append("\x1b[H\x1b[2J\x1b[?2026l");
-            try tty.writeAll(self.frame.items);
-            return;
+            return self.frame.items;
         }
         const buffer = &self.document.buffer;
         const bytes = buffer.bytes.items;
@@ -686,7 +691,7 @@ pub const Editor = struct {
             try self.append(if (self.mode == .insert) "\x1b[6 q" else "\x1b[2 q");
         }
         try self.append("\x1b[?25h\x1b[?2026l");
-        try tty.writeAll(self.frame.items);
+        return self.frame.items;
     }
 
     fn stepRow(self: *Editor, row: Row, forward: bool) !?Row {
