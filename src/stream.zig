@@ -7,6 +7,9 @@ pub const Row = struct {
     file: usize,
     start: usize = 0,
     gap: bool = false,
+    // A line end found while rendering, reused for the next forward step.
+    // Rows are local to one traversal; never retain this across buffer edits.
+    end: ?usize = null,
 };
 
 pub const Stream = struct {
@@ -75,7 +78,7 @@ pub const Stream = struct {
         const buffer = &document.buffer;
         const start = buffer.lineStart(@min(row.start, buffer.bytes.items.len));
         if (forward) {
-            const end = buffer.lineEnd(start);
+            const end = row.end orelse buffer.lineEnd(start);
             if (end < buffer.bytes.items.len) return .{ .file = row.file, .start = buffer.nextIndex(end) };
             if (try self.adjacent(row.file, true, wrap) == null) return null;
             return .{ .file = row.file, .gap = true };

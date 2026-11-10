@@ -108,13 +108,13 @@ pub const Editor = struct {
         const previous_row = if (key == .paste_end and self.paste_origin_row != null)
             self.paste_origin_row.?
         else
-            std.mem.count(u8, self.document.buffer.bytes.items[0..self.document.buffer.cursor], "\n");
+            self.document.buffer.cursor_row;
         if (key == .paste_start) self.paste_origin_row = previous_row;
         if (key == .paste_end) self.paste_origin_row = null;
         const previous_transition = self.transitions;
         const quit = try self.handleKey(key);
         if (self.transitions == previous_transition) {
-            const row = std.mem.count(u8, self.document.buffer.bytes.items[0..self.document.buffer.cursor], "\n");
+            const row = self.document.buffer.cursor_row;
             if (row >= previous_row) self.screen_row += row - previous_row else self.screen_row -|= previous_row - row;
             self.screen_row = @min(self.screen_row, self.height - 1);
         }
@@ -293,12 +293,12 @@ pub const Editor = struct {
             const screen_row = self.screen_row;
             var distance: usize = 0;
             while (distance < self.height) {
-                const before = self.document.buffer.lineStart(self.document.buffer.cursor);
+                const before = self.document.buffer.cursor_row;
                 const transition = self.transitions;
                 _ = try self.move(if (motion == .page_up) .up else .down, cross_files);
                 if (transition != self.transitions) {
                     distance += 2; // Include the blank file separator.
-                } else if (before != self.document.buffer.lineStart(self.document.buffer.cursor)) {
+                } else if (before != self.document.buffer.cursor_row) {
                     distance += 1;
                 } else break;
             }
@@ -308,9 +308,10 @@ pub const Editor = struct {
             return true;
         }
         const buffer = &self.document.buffer;
+        const down_end = if (motion == .down) buffer.lineEnd(buffer.cursor) else null;
         const boundary = switch (motion) {
-            .up => buffer.lineStart(buffer.cursor) == 0,
-            .down => buffer.lineEnd(buffer.cursor) == buffer.bytes.items.len,
+            .up => buffer.cursor_row == 0,
+            .down => down_end.? == buffer.bytes.items.len,
             .left => buffer.cursor == 0,
             .right => buffer.cursor == buffer.bytes.items.len,
             else => false,
@@ -330,10 +331,12 @@ pub const Editor = struct {
                 next.setCursor(if (forward) 0 else next.bytes.items.len);
                 if (vertical) {
                     next.moveHome();
-                    const end = next.lineEnd(next.cursor);
-                    for (0..column) |_| {
-                        if (next.cursor == end) break;
-                        next.moveRight();
+                    if (column > 0) {
+                        const end = next.lineEnd(next.cursor);
+                        for (0..column) |_| {
+                            if (next.cursor == end) break;
+                            next.moveRight();
+                        }
                     }
                     next.preferred_column = column;
                 }
@@ -345,7 +348,7 @@ pub const Editor = struct {
         }
         switch (motion) {
             .up => buffer.moveUp(),
-            .down => buffer.moveDown(),
+            .down => buffer.moveDownFromEnd(down_end.?),
             .left => buffer.moveLeft(),
             .right => buffer.moveRight(),
             .home => buffer.moveHome(),
@@ -619,7 +622,7 @@ pub const Editor = struct {
         self.height = size.rows - 2;
         self.screen_row = @min(self.screen_row, self.height - 1);
         if (self.stream) |*stream| self.wrap = try stream.canWrap(self.height);
-        const cursor_row = std.mem.count(u8, bytes[0..buffer.cursor], "\n");
+        const cursor_row = buffer.cursor_row;
         const cursor_column = display.columns(bytes[buffer.lineStart(buffer.cursor)..buffer.cursor]);
         if (cursor_column < self.left_column) self.left_column = cursor_column;
         if (cursor_column >= self.left_column + size.cols) self.left_column = cursor_column - size.cols + 1;
@@ -634,16 +637,18 @@ pub const Editor = struct {
         for (0..self.height) |row| {
             try self.print("\x1b[{d};1H\x1b[2K", .{row + 1});
             if (visible) |line| {
+                var rendered = line;
                 if (!line.gap) {
                     const document = if (self.workspace) |workspace| try workspace.ensure(line.file) else self.document;
                     const start = document.buffer.lineStart(@min(line.start, document.buffer.bytes.items.len));
                     const end = document.buffer.lineEnd(start);
+                    rendered.end = end;
                     if (self.workspace == null or line.file == self.current_file) {
                         try self.drawLine(start, end, size.cols);
                     } else try self.drawText(document.buffer.bytes.items[start..end], self.left_column, size.cols);
                 }
                 // Do not prefetch a file below the last visible row.
-                if (row + 1 < self.height) visible = try self.stepRow(line, true);
+                if (row + 1 < self.height) visible = try self.stepRow(rendered, true);
             } else if (self.current_file == null and self.workspace != null and row == 0) {
                 try self.drawText("No readable files in this workspace", 0, size.cols);
             } else {
@@ -698,7 +703,7 @@ pub const Editor = struct {
         if (self.stream) |*stream| return stream.step(row, forward, self.wrap);
         const buffer = &self.document.buffer;
         if (forward) {
-            const end = buffer.lineEnd(row.start);
+            const end = row.end orelse buffer.lineEnd(row.start);
             return if (end < buffer.bytes.items.len) Row{ .file = 0, .start = buffer.nextIndex(end) } else null;
         }
         return if (row.start > 0) Row{ .file = 0, .start = buffer.lineStart(buffer.previousIndex(row.start)) } else null;
@@ -798,7 +803,67 @@ fn testingDocument(text: []const u8) !content.Document {
 }
 
 fn typeKeys(editor: *Editor, keys: []const u8) !void {
-    for (keys) |byte| try std.testing.expect(!try editor.handle(if (byte == 0x1b) .escape else .{ .byte = byte }));
+    for (keys) |byte| {
+        try std.testing.expect(!try editor.handle(if (byte == 0x1b) .escape else .{ .byte = byte }));
+        const buffer = &editor.document.buffer;
+        try std.testing.expectEqual(std.mem.count(u8, buffer.bytes.items[0..buffer.cursor], "\n"), buffer.cursor_row);
+    }
+}
+
+fn expectStatusRow(editor: *Editor, row: usize) !void {
+    const frame = try editor.renderFrame(.{ .rows = 6, .cols = 80 });
+    var expected: [64]u8 = undefined;
+    const status = try std.fmt.bufPrint(&expected, "  {d}:", .{row});
+    try std.testing.expect(std.mem.indexOf(u8, frame, status) != null);
+}
+
+test "status row follows edits, bracketed paste, and paging" {
+    var doc = try testingDocument("one\r\ntwo\r\nthree");
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "unused");
+    defer editor.deinit();
+    try typeKeys(&editor, "jj");
+    try expectStatusRow(&editor, 3);
+    try typeKeys(&editor, "dd");
+    try std.testing.expectEqualStrings("one\r\ntwo", doc.buffer.bytes.items);
+    try expectStatusRow(&editor, 2);
+    try typeKeys(&editor, "i");
+    _ = try editor.handle(.paste_start);
+    try typeKeys(&editor, "a\r\nb\nc\nd\ne\nf");
+    _ = try editor.handle(.paste_end);
+    try expectStatusRow(&editor, 7);
+    _ = try editor.handle(.escape);
+    _ = try editor.handle(.page_up);
+    try expectStatusRow(&editor, 3);
+    _ = try editor.handle(.page_down);
+    try expectStatusRow(&editor, 7);
+}
+
+test "rendered long lines cross CRLF, empty lines, and file boundaries" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const long = try allocator.alloc(u8, 65536);
+    defer allocator.free(long);
+    @memset(long, 'x');
+    @memcpy(long[long.len - 10 ..], "\r\ntail\r\n\r\n");
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = long });
+    try temp.dir.writeFile(.{ .sub_path = "b", .data = "second\nlast" });
+    const root = try temp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    var workspace = try Workspace.open(allocator, root, null);
+    defer workspace.deinit();
+    var editor = try Editor.initWorkspace(allocator, &workspace);
+    defer editor.deinit();
+    const frame = try editor.renderFrame(.{ .rows = 10, .cols = 80 });
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[2;1H\x1b[2Ktail") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[6;1H\x1b[2Ksecond") != null);
+    try typeKeys(&editor, "jjjjj");
+    try std.testing.expectEqual(@as(?usize, 1), editor.current_file);
+    try expectStatusRow(&editor, 2);
+    try typeKeys(&editor, "kk");
+    try std.testing.expectEqual(@as(?usize, 0), editor.current_file);
+    try expectStatusRow(&editor, 4);
 }
 
 test "visual selection includes whole scalars and CRLF in either direction" {
