@@ -1,5 +1,6 @@
 const std = @import("std");
 const storage = @import("storage.zig");
+const Loader = @import("loader.zig").Job;
 
 pub const cache_file_limit = 8;
 pub const cache_byte_limit = 8 * 1024 * 1024;
@@ -15,6 +16,8 @@ pub const Entry = struct {
     load_error: ?anyerror = null,
     last_used: u64 = 0,
     allow_new: bool = false,
+    // Changes to contents or residency invalidate borrowed search positions.
+    revision: u64 = 0,
 };
 
 pub const SaveAllResult = struct {
@@ -34,6 +37,12 @@ pub const Workspace = struct {
     initial_index: usize = 0,
     active_index: ?usize = null,
     clock: u64 = 0,
+    requested: ?*Loader = null,
+    next_requested: ?usize = null,
+    // Protect the actual viewport, even when it spans more than eight files.
+    // Search scans do not call request() and never enter this list.
+    viewport: std.ArrayList(usize) = .empty,
+    collecting_viewport: bool = false,
 
     pub fn open(allocator: std.mem.Allocator, root_path: []const u8, initial_path: ?[]const u8) !Workspace {
         var self: Workspace = .{
@@ -79,12 +88,14 @@ pub const Workspace = struct {
     }
 
     pub fn deinit(self: *Workspace) void {
+        if (self.requested) |job| job.deinit();
         while (self.resident.items.len != 0) self.unload(self.resident.items[self.resident.items.len - 1]);
         for (self.entries.items) |*entry| {
             self.allocator.free(entry.name);
             self.allocator.free(entry.path);
         }
         self.resident.deinit(self.allocator);
+        self.viewport.deinit(self.allocator);
         self.entries.deinit(self.allocator);
         self.allocator.free(self.root);
     }
@@ -166,17 +177,114 @@ pub const Workspace = struct {
                 return error.FileNotFound;
             }
             entry.document = document;
+            entry.revision +%= 1;
             // An evicted file may have changed on disk since its previous load.
             entry.line_count = null;
             self.resident.appendAssumeCapacity(index);
         }
         if (entry.line_count == null) {
-            entry.line_count = 1 + std.mem.count(u8, entry.document.?.buffer.bytes.items, "\n");
+            entry.line_count = entry.document.?.buffer.line_count;
         }
         self.clock +%= 1;
         entry.last_used = self.clock;
         self.trim(index);
         return entry.document.?;
+    }
+
+    /// Admit a document already prepared off the UI thread. Ownership transfers
+    /// only on success; callers must validate their search/load revision first.
+    pub fn adopt(self: *Workspace, index: usize, prepared: storage.Document, line_count: usize) !*storage.Document {
+        const entry = &self.entries.items[index];
+        if (entry.document != null) return error.DocumentAlreadyResident;
+        try self.resident.ensureUnusedCapacity(self.allocator, 1);
+        const document = try self.allocator.create(storage.Document);
+        document.* = prepared;
+        entry.document = document;
+        entry.line_count = line_count;
+        entry.load_error = null;
+        entry.revision +%= 1;
+        self.resident.appendAssumeCapacity(index);
+        self.clock +%= 1;
+        entry.last_used = self.clock;
+        self.trim(index);
+        return document;
+    }
+
+    /// Begin/end surround a frame, not a search. Deferring trim until the end
+    /// prevents a frame with many small files from evicting its own first rows.
+    pub fn beginFrame(self: *Workspace) void {
+        self.viewport.clearRetainingCapacity();
+        self.collecting_viewport = true;
+    }
+
+    pub fn endFrame(self: *Workspace) void {
+        self.collecting_viewport = false;
+        self.trim(self.active_index orelse 0);
+    }
+
+    /// Nonblocking readiness request used by interactive viewport traversal.
+    /// Resident hits do not recount a potentially large edited buffer.
+    pub fn request(self: *Workspace, index: usize) !?*storage.Document {
+        const entry = &self.entries.items[index];
+        if (self.collecting_viewport and std.mem.indexOfScalar(usize, self.viewport.items, index) == null)
+            try self.viewport.append(self.allocator, index);
+        if (entry.load_error) |err| return err;
+        if (entry.document) |document| {
+            self.clock +%= 1;
+            entry.last_used = self.clock;
+            return document;
+        }
+        if (self.requested) |job| {
+            // Keep one latest request, rather than an unbounded queue of rows
+            // that may cease to be visible before preparation completes.
+            self.next_requested = if (job.index == index and !job.cancelled.load(.acquire)) null else index;
+        } else {
+            self.requested = try Loader.start(self.allocator, entry.path, index, entry.revision, entry.allow_new);
+        }
+        return null;
+    }
+
+    pub fn hasPendingRequest(self: *const Workspace) bool {
+        return self.requested != null or self.next_requested != null;
+    }
+
+    /// Superseded work is discarded when it finishes; cancellation never joins
+    /// a running worker on the input/rendering thread.
+    pub fn cancelRequested(self: *Workspace) void {
+        if (self.requested) |job| job.cancel();
+        self.next_requested = null;
+    }
+
+    /// Publish completed preparation, then start the latest waiting request.
+    /// Returns whether a readiness/failure change calls for another frame.
+    pub fn pollRequested(self: *Workspace) !bool {
+        const job = self.requested orelse return false;
+        if (!job.isDone()) return false;
+        self.requested = null;
+        defer job.deinit();
+        const entry = &self.entries.items[job.index];
+        var changed = false;
+        if (!job.cancelled.load(.acquire) and entry.revision == job.revision and entry.document == null) {
+            if (job.document) |document| {
+                _ = try self.adopt(job.index, document, job.line_count);
+                job.document = null;
+                changed = true;
+            } else if (job.failure) |err| {
+                if (err == error.OutOfMemory) return err;
+                entry.load_error = err;
+                changed = true;
+            }
+        }
+        const next = self.next_requested;
+        self.next_requested = null;
+        if (next) |index| {
+            // It may already have been admitted by a search destination.
+            _ = self.request(index) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return true;
+            };
+        }
+        return changed;
     }
 
     fn unload(self: *Workspace, index: usize) void {
@@ -185,6 +293,7 @@ pub const Workspace = struct {
             document.deinit();
             self.allocator.destroy(document);
             entry.document = null;
+            entry.revision +%= 1;
             const position = std.mem.indexOfScalar(usize, self.resident.items, index).?;
             _ = self.resident.swapRemove(position);
         }
@@ -203,7 +312,8 @@ pub const Workspace = struct {
                 if (entry.dirty or document.is_new) continue;
                 count += 1;
                 bytes += document.buffer.bytes.capacity;
-                if (index == requested or self.active_index == index) continue;
+                if (index == requested or self.active_index == index or
+                    std.mem.indexOfScalar(usize, self.viewport.items, index) != null) continue;
                 if (oldest == null or entry.last_used < self.entries.items[oldest.?].last_used) oldest = index;
             }
             if (count <= cache_file_limit and bytes <= cache_byte_limit) return;
@@ -215,6 +325,7 @@ pub const Workspace = struct {
         std.debug.assert(self.entries.items[index].document != null);
         self.entries.items[index].dirty = true;
         self.entries.items[index].line_count = null;
+        self.entries.items[index].revision +%= 1;
     }
 
     pub fn hasChanges(self: *const Workspace) bool {
@@ -266,6 +377,129 @@ fn entryLessThan(_: void, a: Entry, b: Entry) bool {
         left = left[a_slash.? + 1 ..];
         right = right[b_slash.? + 1 ..];
     }
+}
+
+fn finishRequested(workspace: *Workspace) !void {
+    for (0..5000) |_| {
+        _ = try workspace.pollRequested();
+        if (!workspace.hasPendingRequest()) return;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    return error.LoaderDidNotFinish;
+}
+
+test "asynchronous requests prepare content without admitting until polled" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = "one\r\ntwo\r\n" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+
+    try std.testing.expect(try workspace.request(0) == null);
+    try std.testing.expect(workspace.hasPendingRequest());
+    try std.testing.expect(workspace.entries.items[0].document == null);
+    try std.testing.expectEqual(@as(u64, 0), workspace.entries.items[0].revision);
+    try finishRequested(&workspace);
+    const entry = &workspace.entries.items[0];
+    try std.testing.expectEqualStrings("one\r\ntwo\r\n", entry.document.?.buffer.bytes.items);
+    try std.testing.expectEqualStrings("\r\n", entry.document.?.buffer.newline);
+    try std.testing.expectEqual(@as(?usize, 3), entry.line_count);
+    const revision = entry.revision;
+    try std.testing.expectEqual(entry.document, try workspace.request(0));
+    try std.testing.expectEqual(revision, entry.revision);
+
+    try entry.document.?.buffer.insert(entry.document.?.allocator, "new\n");
+    workspace.markDirty(0);
+    try std.testing.expect(entry.revision != revision);
+    try std.testing.expect(entry.line_count == null);
+    _ = try workspace.request(0);
+    try std.testing.expect(entry.line_count == null); // no synchronous recount
+}
+
+test "obsolete loader completion cannot replace a resident edited document" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = "original" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    _ = try workspace.request(0);
+    const document = try workspace.ensure(0);
+    try document.buffer.insert(std.testing.allocator, "edited ");
+    workspace.markDirty(0);
+    const revision = workspace.entries.items[0].revision;
+    try finishRequested(&workspace);
+    try std.testing.expectEqual(document, workspace.entries.items[0].document.?);
+    try std.testing.expectEqualStrings("edited original", document.buffer.bytes.items);
+    try std.testing.expectEqual(revision, workspace.entries.items[0].revision);
+}
+
+test "cancelled loading is discarded and only the latest waiting request starts" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    for ([_][]const u8{ "a", "b", "c" }) |name|
+        try temp.dir.writeFile(.{ .sub_path = name, .data = name });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    _ = try workspace.request(0);
+    workspace.cancelRequested();
+    _ = try workspace.request(1);
+    _ = try workspace.request(2);
+    try finishRequested(&workspace);
+    try std.testing.expect(workspace.entries.items[0].document == null);
+    try std.testing.expect(workspace.entries.items[1].document == null);
+    try std.testing.expectEqualStrings("c", workspace.entries.items[2].document.?.buffer.bytes.items);
+}
+
+test "asynchronous viewport larger than cache finishes without eviction cycling" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const file_count = cache_file_limit + 4;
+    for (0..file_count) |index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "file{d:0>2}", .{index});
+        try temp.dir.writeFile(.{ .sub_path = name, .data = "x" });
+    }
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    workspace.active_index = 0;
+    var complete = false;
+    for (0..file_count + 1) |_| {
+        workspace.beginFrame();
+        var ready: usize = 0;
+        for (0..file_count) |index| {
+            if (try workspace.request(index) == null) break;
+            ready += 1;
+        }
+        workspace.endFrame();
+        if (ready == file_count) {
+            complete = true;
+            break;
+        }
+        try finishRequested(&workspace);
+    }
+    try std.testing.expect(complete);
+    try std.testing.expectEqual(file_count, workspace.resident.items.len);
+    workspace.beginFrame();
+    _ = try workspace.request(0);
+    workspace.endFrame();
+    try std.testing.expect(workspace.resident.items.len <= cache_file_limit);
+    try std.testing.expect(workspace.entries.items[0].document != null);
+    var evicted = false;
+    for (workspace.entries.items[1..]) |entry| {
+        if (entry.document == null) {
+            evicted = true;
+            try std.testing.expect(entry.revision >= 2);
+        }
+    }
+    try std.testing.expect(evicted);
 }
 
 test "catalog orders containers first recursively without reading file contents" {

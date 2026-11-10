@@ -21,6 +21,8 @@ const usage =
     \\  x       delete a character or selection
     \\  D / C   delete / change through end of line
     \\  y/d/c + hjkl, 0, $, arrows, Home, End operate on a motion
+    \\  /text   search forward (literal, case-sensitive; Enter starts)
+    \\  n       next match; Escape cancels a pending search
     \\  :w      write all changed files
     \\  :wt     write the file under the cursor
     \\  :q      quit (refuses unsaved changes)

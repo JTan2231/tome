@@ -69,6 +69,8 @@ insert or command entry. The status bar shows the current mode and file.
 | Text / Enter / Tab | Insert text / newline / literal tab in insert |
 | Backspace / Delete | Delete before / at the cursor in insert |
 | `:` | Enter an editor command from normal |
+| `/` | Enter a forward literal search in normal or visual mode; Enter starts it |
+| `n` | Find the next occurrence of the last search from the cursor |
 
 Visual selections include the character under the cursor. Press the same visual
 key again to cancel, or the other one to switch between characters and lines.
@@ -94,18 +96,45 @@ Type a command and press Enter:
 
 Write and quit are the only commands. Command entry is a prompt within normal
 mode. Numeric counts, word motions, block selections, named registers, undo,
-search, and configuration are not implemented. The cursor denotes an insertion
+regular-expression search, and configuration are not implemented. The cursor denotes an insertion
 position, including after the last character of a line; horizontal movement can
 cross line boundaries. This differs from Vim's normal-mode cursor semantics.
+
+Search is literal and case-sensitive, with UTF-8 prompt input and a maximum query
+length of 1,024 bytes. An empty `/` prompt followed by Enter repeats the previous
+query. Normal-mode search follows the workspace's browsing order, starting after
+the cursor and wrapping once; visual-mode search stays within the current file
+and extends the selection. A sole occurrence at the cursor is found on wrapping.
+Insert mode treats `/` and `n` as text.
+
+The current view remains usable while searching. Escape, manual movement,
+editing, or another command cancels a pending jump; repeated `n` while searching
+coalesces into the current request. A new query replaces the old one. Matches use
+resident text, including unsaved edits, and stream unloaded files from disk.
+Search pauses at the next match without collecting every occurrence. A complete
+pass with no match reports `Pattern not found`; skipped unreadable, changing, or
+oversized files are reported as incomplete coverage. The startup file catalog
+and existing 64 MiB file limit apply to search too.
 
 ## Behavior and limits
 
 - Vertical and horizontal scrolling follow the cursor; lines do not wrap.
 - Discovery records file paths, without reading every file into a buffer. Contents
   load as they approach the viewport. Clean buffers use a cache limited to eight
-  files or 8 MiB, with the active and currently requested file protected. Unsaved
+  files or 8 MiB, with the active, currently requested, and visible files protected.
+  A viewport spanning many or large files can exceed this budget. Unsaved
   buffers stay in memory until saved or discarded, so their size can exceed this
   cache budget.
+- Interactive frames request missing content asynchronously and can show blank
+  filler rows until it is ready. Search scans use separate, bounded 64 KiB chunks
+  and do not admit files, change cache recency, or evict editor buffers. Only the
+  chosen destination is prepared as an editor document, off the input thread.
+  The worker also prepares sparse display positions for the matched line, so
+  redrawing a match far into a long line does not walk its entire prefix.
+  Resident text reaches the search worker through bounded, revision-checked
+  copies; stale results cannot overwrite edits or perform a canceled jump.
+  Initial file opening and explicit ordinary navigation retain their synchronous
+  loading behavior. Disk bandwidth and the OS file cache are shared with search.
 - The file list is a snapshot taken at startup. Hidden regular files are included;
   `.git` directories and symlinks are skipped during discovery. Unreadable or
   oversized neighbors are skipped when browsing. An explicitly requested file reports an
@@ -145,6 +174,14 @@ workspace discovery, caching, and preparation for rendering. `Workspace.ensure`
 is the per-file request-to-ready boundary. It returns after the buffer, newline
 style, and line count are available and cache eviction has completed. The editor,
 viewport traversal, display formatting, and terminal I/O remain in `src/`.
+
+Interactive rendering uses `Workspace.request` and `pollRequested` for background
+preparation and main-thread publication; the synchronous `ensure` boundary remains
+available to explicit navigation and measurement. Search has one cancellable
+worker with a bounded mailbox, independent of the viewport loader. It reads
+versioned resident chunks or streams disk files, returning one location and, for
+an unloaded destination, a prepared document. Workspace ownership and cache
+admission remain on the editor thread. Line counts are maintained during edits.
 
 `measurement/` contains a separate harness that calls this same boundary without
 starting the editor or terminal. It measures one requested file with a monotonic
@@ -199,5 +236,6 @@ tests require Python 3.10 or later; `pty_smoke.py` drives the built editor throu
 a pseudo-terminal. Python is not needed to build or run the editor.
 Tests cover editing, visual selections, yank and paste, UTF-8, CRLF, save
 conflicts, directory ordering, file navigation and looping, workspace writes,
+search ordering, cancellation and cache isolation, asynchronous viewport loading,
 resizing, and terminal restoration. Use
 `zig build -Doptimize=ReleaseSafe` for a release build.

@@ -115,8 +115,12 @@ pub const Terminal = struct {
     }
 
     pub fn readKey(self: *Terminal) !Key {
+        return self.readKeyTimeout(idle_timeout_ms);
+    }
+
+    pub fn readKeyTimeout(self: *Terminal, timeout_ms: i32) !Key {
         if (self.at_eof or interrupted.load(.monotonic)) return .eof;
-        const byte = (try self.readByte(idle_timeout_ms)) orelse {
+        const byte = (try self.readByte(timeout_ms)) orelse {
             return if (self.at_eof or interrupted.load(.monotonic)) .eof else .tick;
         };
         if (self.pasting) return self.readPaste(byte);

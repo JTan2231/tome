@@ -52,8 +52,12 @@ fn scalarWidth(c: u21) usize {
 }
 
 pub fn columns(bytes: []const u8) usize {
+    return columnsFrom(bytes, 0);
+}
+
+pub fn columnsFrom(bytes: []const u8, initial: usize) usize {
     var index: usize = 0;
-    var column: usize = 0;
+    var column: usize = initial;
     while (index < bytes.len) {
         const unit = cell(bytes[index..], column);
         column += unit.width;

@@ -14,12 +14,19 @@ pub const Row = struct {
 
 pub const Stream = struct {
     workspace: *Workspace,
+    async_load: bool = false,
 
     pub fn init(workspace: *Workspace) Stream {
         return .{ .workspace = workspace };
     }
 
     fn load(self: *Stream, file: usize) !?*Document {
+        if (self.async_load) {
+            return (self.workspace.request(file) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return null;
+            }) orelse return error.LoadPending;
+        }
         return self.workspace.ensure(file) catch |err| {
             if (err == error.OutOfMemory) return err;
             return null;
@@ -35,7 +42,18 @@ pub const Stream = struct {
         for (0..entries.len) |offset| {
             const file = (first + offset) % entries.len;
             if (entries[file].load_error != null) continue;
-            if (entries[file].line_count == null) _ = try self.load(file);
+            if (entries[file].line_count == null) {
+                if (self.async_load and entries[file].document != null) {
+                    entries[file].line_count = entries[file].document.?.buffer.line_count;
+                } else {
+                    // Unknown files must eventually be probed even when the
+                    // cursor starts near the end of a short workspace.
+                    _ = self.load(file) catch |err| switch (err) {
+                        error.LoadPending => return false,
+                        else => return err,
+                    };
+                }
+            }
             lines +|= entries[file].line_count orelse 0;
             if (lines > height) return true;
         }
@@ -187,4 +205,59 @@ test "empty directories have no rows and cannot wrap" {
     try std.testing.expect(!try stream.canWrap(22));
     try std.testing.expect(try stream.adjacent(0, true, true) == null);
     try std.testing.expect(try stream.step(.{ .file = 0 }, true, true) == null);
+}
+
+test "async traversal waits for the next file without skipping pending content" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = "one" });
+    try temp.dir.writeFile(.{ .sub_path = "b", .data = "two" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    workspace.active_index = 0;
+    _ = try workspace.ensure(0);
+    var stream = Stream.init(&workspace);
+    stream.async_load = true;
+    try std.testing.expectError(error.LoadPending, stream.step(.{ .file = 0 }, true, false));
+    try std.testing.expect(workspace.entries.items[1].document == null);
+    for (0..5000) |_| {
+        _ = try workspace.pollRequested();
+        if (!workspace.hasPendingRequest()) break;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(!workspace.hasPendingRequest());
+    const gap = (try stream.step(.{ .file = 0 }, true, false)).?;
+    try std.testing.expectEqualDeep(Row{ .file = 0, .gap = true }, gap);
+    try std.testing.expectEqualDeep(Row{ .file = 1 }, (try stream.step(gap, true, false)).?);
+}
+
+test "async wrap probing eventually discovers earlier files from the last file" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = "one\ntwo\nthree" });
+    try temp.dir.writeFile(.{ .sub_path = "z", .data = "last" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    workspace.active_index = 1;
+    _ = try workspace.ensure(1);
+    var stream = Stream.init(&workspace);
+    stream.async_load = true;
+    try std.testing.expect(!try stream.canWrap(2));
+    try std.testing.expect(workspace.hasPendingRequest());
+    for (0..5000) |_| {
+        _ = try workspace.pollRequested();
+        if (!workspace.hasPendingRequest()) break;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(try stream.canWrap(2));
+    const document = workspace.entries.items[1].document.?;
+    try document.buffer.insert(document.allocator, "new\nrows\n");
+    workspace.markDirty(1);
+    try std.testing.expect(workspace.entries.items[1].line_count == null);
+    try std.testing.expect(try stream.canWrap(2));
+    try std.testing.expectEqual(document.buffer.line_count, workspace.entries.items[1].line_count.?);
 }

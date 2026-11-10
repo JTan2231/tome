@@ -319,6 +319,8 @@ def directory_browse_order_and_margin(directory):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
     with Editor(cwd=directory) as editor:
+        # Neighbor contents arrive asynchronously after the active file.
+        editor.expect(entries[-1][1])
         frame = editor.frame_after()
         assert_current(frame, entries[0][0])
         offsets = [frame.index(content) for _, content in entries]
@@ -390,6 +392,7 @@ def long_workspace_wraps_between_files(directory):
     first.write_bytes(b"\n".join(a_lines))
     second.write_bytes(b"\n".join(b_lines))
     with Editor(cwd=directory) as editor:
+        editor.expect(b_lines[0])
         assert_current(editor.frame_after(b"k0"), "b.txt")
         editor.insert(b"last:")
         assert_current(editor.frame_after(b"j0"), "a.txt")
@@ -457,6 +460,127 @@ def empty_workspace_is_browsable(directory):
     assert not list(directory.iterdir()), "empty browsing invented a file"
 
 
+
+def search_forward_repeat_wrap_and_literals(directory):
+    first = directory / "a.txt"
+    second = directory / "b.txt"
+    first.write_bytes(b"start Needle n.edle needle")
+    second.write_bytes(b"last needle")
+    with Editor(cwd=directory) as editor:
+        # Literal punctuation does not match the earlier capitalized word.
+        editor.send(b"/n.edle\r", b"NORMAL  1:14  ")
+        assert_current(editor.frame_after(), "a.txt")
+        # Matching is case-sensitive; the lowercase word follows both above.
+        editor.send(b"/needle\r", b"NORMAL  1:21  ")
+        assert_current(editor.frame_after(), "a.txt")
+        editor.send(b"n", b"NORMAL  1:6  ")
+        assert_current(editor.frame_after(), "b.txt")
+        editor.send(b"n", b"Search wrapped")
+        frame = editor.frame_after()
+        assert_current(frame, "a.txt")
+        assert b"NORMAL  1:21  " in frame, frame
+        # A no-match search leaves the last successful position untouched.
+        editor.send(b"/missing\r", b"Pattern not found")
+        frame = editor.frame_after()
+        assert_current(frame, "a.txt")
+        assert b"NORMAL  1:21  " in frame, frame
+        editor.quit()
+    assert first.read_bytes() == b"start Needle n.edle needle"
+    assert second.read_bytes() == b"last needle"
+
+
+def search_unicode_backspace_and_insert_literals(directory):
+    path = directory / "unicode.txt"
+    path.write_bytes("start héλ end".encode())
+    with Editor(cwd=directory) as editor:
+        # One backspace removes a whole scalar from the search prompt.
+        editor.send(b"/" + "hé界".encode() + b"\x7f" + "λ".encode() + b"\r",
+                    b"NORMAL  1:7  ")
+        editor.insert(b"/n")
+        editor.write()
+        assert path.read_bytes() == "start /nhéλ end".encode()
+        editor.quit()
+
+
+def search_visual_stays_in_current_file(directory):
+    first = directory / "a.txt"
+    second = directory / "b.txt"
+    first.write_bytes(b"a target z")
+    second.write_bytes(b"elsewhere")
+    with Editor(cwd=directory) as editor:
+        editor.send(b"v/target\r", b"VISUAL  1:3  ")
+        start = editor.output.rfind(b"\x1b[?2026h")
+        editor.expect(b"\x1b[?2026l", start)
+        assert b"\x1b[7ma t\x1b[27m" in editor.output[start:], editor.output[start:]
+        frame = editor.frame_after()
+        assert_current(frame, "a.txt")
+        # frame_after uses : and Escape, so start a fresh visual selection.
+        editor.send(b"v/elsewhere\r", b"Pattern not found")
+        frame = editor.frame_after()
+        assert_current(frame, "a.txt")
+        editor.quit()
+    assert first.read_bytes() == b"a target z"
+    assert second.read_bytes() == b"elsewhere"
+
+
+def search_unsaved_buffers_across_files(directory):
+    first = directory / "a.txt"
+    second = directory / "b.txt"
+    first.write_bytes(b"alpha")
+    second.write_bytes(b"bravo")
+    with Editor(cwd=directory) as editor:
+        editor.insert(b"unsaved ")
+        assert_current(editor.frame_after(b"j0"), "b.txt")
+        editor.send(b"/unsaved\r", b"Search wrapped")
+        frame = editor.frame_after()
+        assert_current(frame, "a.txt")
+        assert b"NORMAL [+]  1:1  " in frame, frame
+        assert first.read_bytes() == b"alpha", "search saved the dirty buffer"
+        editor.quit(force=True)
+    assert first.read_bytes() == b"alpha"
+    assert second.read_bytes() == b"bravo"
+
+
+def search_cancel_and_supersede_pending_navigation(directory):
+    first = directory / "a.txt"
+    far = directory / "z.txt"
+    # Keep the large file outside the initial viewport, and make a distant hit.
+    original = b"start near\n" + b"visible\n" * 30
+    first.write_bytes(original)
+    with far.open("wb") as handle:
+        for _ in range(512):
+            handle.write(b"padding\n" * 8192)
+        handle.write(b"far-target\n")
+    with Editor(cwd=directory) as editor:
+        # Canceling prompt entry does not change the cursor or remembered query.
+        editor.send(b"/far-target\x1b", b"NORMAL  1:1  ")
+        # Input following Enter must supersede any eventual distant jump.
+        editor.send(b"/far-target\rilocal-", b"INSERT")
+        editor.send(b"\x1b", b"NORMAL")
+        editor.send(b"0", b"NORMAL [+]  1:1  ")
+        # A new search also waits for cancellation without losing the new intent.
+        editor.send(b"/near\r", b"NORMAL [+]  1:13  ")
+        editor.send(b"/far-target\rh", b"NORMAL [+]  1:12  ")
+        editor.send(b"/near\r", b"NORMAL [+]  1:13  ")
+        frame = editor.frame_after()
+        assert_current(frame, "a.txt")
+        editor.write()
+        assert first.read_bytes() == b"local-" + original
+        editor.quit()
+
+
+def search_reports_incomplete_coverage(directory):
+    first = directory / "a.txt"
+    large = directory / "z.big"
+    first.write_bytes(b"searchable\n" + b"visible\n" * 30)
+    with large.open("wb") as handle:
+        handle.truncate(65 * 1024 * 1024)
+    with Editor(cwd=directory) as editor:
+        editor.send(b"/absent\r", b"Search incomplete")
+        assert_current(editor.frame_after(), "a.txt")
+        editor.quit()
+    assert large.stat().st_size == 65 * 1024 * 1024
+
 def main():
     if not BINARY.is_file():
         raise SystemExit(f"Build the editor first with `zig build`: missing {BINARY}")
@@ -475,7 +599,13 @@ def main():
              selections_stay_in_file_and_register_crosses_files,
              workspace_save_continues_after_conflict,
              oversized_neighbor_is_skipped,
-             empty_workspace_is_browsable]
+             empty_workspace_is_browsable,
+             search_forward_repeat_wrap_and_literals,
+             search_unicode_backspace_and_insert_literals,
+             search_visual_stays_in_current_file,
+             search_unsaved_buffers_across_files,
+             search_cancel_and_supersede_pending_navigation,
+             search_reports_incomplete_coverage]
     with tempfile.TemporaryDirectory(prefix="tome-pty-") as temporary:
         for case in cases:
             directory = Path(temporary) / case.__name__

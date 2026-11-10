@@ -5,13 +5,19 @@ pub const Buffer = struct {
     cursor: usize = 0,
     // Number of LF bytes before cursor; maintained together with cursor.
     cursor_row: usize = 0,
+    // Maintained with edits so rendering never needs to recount a whole file.
+    line_count: usize = 1,
     preferred_column: ?usize = null,
     newline: []const u8,
 
     pub fn init(bytes: std.ArrayList(u8)) Buffer {
         const first_lf = std.mem.indexOfScalar(u8, bytes.items, '\n') orelse 0;
         const crlf = first_lf > 0 and bytes.items[first_lf - 1] == '\r';
-        return .{ .bytes = bytes, .newline = if (crlf) "\r\n" else "\n" };
+        return .{
+            .bytes = bytes,
+            .newline = if (crlf) "\r\n" else "\n",
+            .line_count = 1 + std.mem.count(u8, bytes.items, "\n"),
+        };
     }
 
     pub fn deinit(self: *Buffer, allocator: std.mem.Allocator) void {
@@ -126,18 +132,22 @@ pub const Buffer = struct {
         try self.bytes.insertSlice(allocator, self.cursor, text);
         self.cursor += text.len;
         self.cursor_row += added_rows;
+        self.line_count += added_rows;
         self.repairCursor();
         self.preferred_column = null;
     }
 
     pub fn replaceRange(self: *Buffer, allocator: std.mem.Allocator, start: usize, end: usize, text: []const u8) !void {
         std.debug.assert(start <= end and end <= self.bytes.items.len);
-        const row = self.rowAt(start) + std.mem.count(u8, text, "\n");
+        const added_rows = std.mem.count(u8, text, "\n");
+        const removed_rows = std.mem.count(u8, self.bytes.items[start..end], "\n");
+        const row = self.rowAt(start) + added_rows;
         const removed = end - start;
         if (text.len > removed) try self.bytes.ensureUnusedCapacity(allocator, text.len - removed);
         self.bytes.replaceRangeAssumeCapacity(start, removed, text);
         self.cursor = start + text.len;
         self.cursor_row = row;
+        self.line_count = self.line_count - removed_rows + added_rows;
         self.repairCursor();
         self.preferred_column = null;
     }
@@ -159,6 +169,7 @@ pub const Buffer = struct {
     pub fn deleteForward(self: *Buffer) bool {
         if (self.cursor == self.bytes.items.len) return false;
         const end = self.nextIndex(self.cursor);
+        self.line_count -= std.mem.count(u8, self.bytes.items[self.cursor..end], "\n");
         self.bytes.replaceRangeAssumeCapacity(self.cursor, end - self.cursor, "");
         self.repairCursor();
         self.preferred_column = null;
@@ -168,7 +179,9 @@ pub const Buffer = struct {
     pub fn backspace(self: *Buffer) bool {
         if (self.cursor == 0) return false;
         const start = self.unitStart(self.cursor - 1);
-        self.cursor_row -= std.mem.count(u8, self.bytes.items[start..self.cursor], "\n");
+        const removed_rows = std.mem.count(u8, self.bytes.items[start..self.cursor], "\n");
+        self.cursor_row -= removed_rows;
+        self.line_count -= removed_rows;
         self.bytes.replaceRangeAssumeCapacity(start, self.cursor - start, "");
         self.cursor = start;
         // Joining the neighboring bytes can form a CRLF or UTF-8 scalar.
@@ -336,6 +349,7 @@ test "cursor helpers respect scalar and newline boundaries" {
 
 fn expectCursorRow(buffer: *const Buffer) !void {
     try std.testing.expectEqual(std.mem.count(u8, buffer.bytes.items[0..buffer.cursor], "\n"), buffer.cursor_row);
+    try std.testing.expectEqual(1 + std.mem.count(u8, buffer.bytes.items, "\n"), buffer.line_count);
 }
 
 test "cursor rows remain accurate across all movement and repaired byte positions" {

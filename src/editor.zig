@@ -5,6 +5,7 @@ const display = @import("display.zig");
 const Workspace = content.Workspace;
 const Stream = @import("stream.zig").Stream;
 const Row = @import("stream.zig").Row;
+const search = content.search;
 
 const Mode = enum { normal, insert, visual, visual_line };
 const Operator = enum { yank, delete, change };
@@ -31,6 +32,17 @@ pub const Editor = struct {
     dirty: bool = false,
     command_active: bool = false,
     command: std.ArrayList(u8) = .empty,
+    search_prompt: bool = false,
+    search_text: std.ArrayList(u8) = .empty,
+    last_search: std.ArrayList(u8) = .empty,
+    search_job: ?*search.Job = null,
+    search_next: ?search.Options = null,
+    search_accept: bool = false,
+    document_revision: u64 = 0,
+    background_redraw: bool = false,
+    search_projection: ?search.Projection = null,
+    projection_document: ?*content.Document = null,
+    projection_revision: u64 = 0,
     frame: std.ArrayList(u8) = .empty,
     message: [512]u8 = undefined,
     message_len: usize = 0,
@@ -77,6 +89,10 @@ pub const Editor = struct {
     }
 
     pub fn deinit(self: *Editor) void {
+        if (self.search_job) |job| job.deinit();
+        self.clearProjection();
+        self.search_text.deinit(self.allocator);
+        self.last_search.deinit(self.allocator);
         if (self.owns_document) {
             self.document.deinit();
             self.allocator.destroy(self.document);
@@ -87,21 +103,41 @@ pub const Editor = struct {
     }
 
     pub fn run(self: *Editor, tty: *terminal.Terminal) !void {
+        if (self.stream) |*stream| stream.async_load = true;
         var size = tty.size();
         try self.draw(tty, size);
         while (true) {
-            const key = try tty.readKey();
+            const timeout_ms: i32 = if (self.search_job != null or self.search_next != null)
+                1
+            else if (self.workspace != null and self.workspace.?.hasPendingRequest())
+                8
+            else
+                100;
+            const key = try tty.readKeyTimeout(timeout_ms);
             if (key == .eof) return;
             if (try self.handle(key)) return;
+            try self.pollBackground();
             const next_size = tty.size();
             const resized = next_size.rows != size.rows or next_size.cols != size.cols;
             size = next_size;
-            if (!self.pasting and (key != .tick or resized)) try self.draw(tty, size);
+            if (!self.pasting and (key != .tick or resized or self.background_redraw)) {
+                self.background_redraw = false;
+                try self.draw(tty, size);
+            }
         }
     }
 
     pub fn handle(self: *Editor, key: terminal.Key) !bool {
-        if (key == .tick) return false;
+        if (key == .tick) {
+            try self.pollBackground();
+            return false;
+        }
+        // Repeated n coalesces while a request is running. Every other input
+        // supersedes its automatic jump before completed work is delivered.
+        const repeat_search = !self.command_active and !self.search_prompt and
+            self.mode != .insert and self.pending_operator == null and
+            key == .byte and key.byte == 'n';
+        if (!repeat_search) self.cancelSearch();
         // A bracketed paste is one movement for viewport purposes. Avoid
         // rescanning the growing buffer for every byte of a large paste.
         if (self.pasting and key != .paste_end) return self.handleKey(key);
@@ -142,6 +178,7 @@ pub const Editor = struct {
             };
             return false;
         }
+        if (self.search_prompt) return self.searchKey(key);
         if (self.command_active) return self.commandKey(key);
         if (key == .tick) return false;
         if (self.workspace != null and self.current_file == null) {
@@ -171,7 +208,7 @@ pub const Editor = struct {
                         self.changed();
                     },
                     '\r', '\n' => {
-                        try buffer.insertNewline(self.allocator);
+                        try buffer.insertNewline(self.document.allocator);
                         self.changed();
                     },
                     '\t', 32...126 => try self.insert(&.{byte}),
@@ -213,6 +250,12 @@ pub const Editor = struct {
                         try self.operate(if (byte == 'D') .delete else .change, range);
                     },
                     'p', 'P' => try self.put(byte == 'P'),
+                    '/' => {
+                        self.search_prompt = true;
+                        self.search_text.clearRetainingCapacity();
+                        self.message_len = 0;
+                    },
+                    'n' => try self.requestSearch(),
                     ':' => {
                         self.mode = .normal;
                         self.command_active = true;
@@ -317,8 +360,13 @@ pub const Editor = struct {
             else => false,
         };
         if (boundary and cross_files and self.stream != null) {
+            // Explicit foreground motion retains its established semantics.
+            // Search navigation adopts a prepared destination separately.
+            var stream = self.stream.?;
+            stream.async_load = false;
+            self.wrap = try stream.canWrap(self.height);
             const forward = motion == .down or motion == .right;
-            if (try self.stream.?.adjacent(self.current_file.?, forward, self.wrap)) |index| {
+            if (try stream.adjacent(self.current_file.?, forward, self.wrap)) |index| {
                 const vertical = motion == .up or motion == .down;
                 const column = buffer.preferred_column orelse buffer.cursorColumn();
                 const document = try self.workspace.?.ensure(index);
@@ -421,7 +469,7 @@ pub const Editor = struct {
             }
         }
         if (!std.mem.eql(u8, bytes[start..range.end], replacement)) {
-            try buffer.replaceRange(self.allocator, start, range.end, replacement);
+            try buffer.replaceRange(self.document.allocator, start, range.end, replacement);
             self.changed();
         }
         buffer.setCursor(start);
@@ -477,7 +525,7 @@ pub const Editor = struct {
             try pasted.appendSlice(self.allocator, buffer.newline);
         }
         if (!std.mem.eql(u8, bytes[start..end], pasted.items)) {
-            try buffer.replaceRange(self.allocator, start, end, pasted.items);
+            try buffer.replaceRange(self.document.allocator, start, end, pasted.items);
             self.changed();
         }
         self.mode = .normal;
@@ -490,6 +538,8 @@ pub const Editor = struct {
     }
 
     fn changed(self: *Editor) void {
+        self.clearProjection();
+        self.document_revision +%= 1;
         self.dirty = true;
         if (self.current_file) |index| {
             self.workspace.?.markDirty(index);
@@ -498,7 +548,7 @@ pub const Editor = struct {
     }
 
     fn insert(self: *Editor, bytes: []const u8) !void {
-        try self.document.buffer.insert(self.allocator, bytes);
+        try self.document.buffer.insert(self.document.allocator, bytes);
         self.changed();
     }
 
@@ -510,12 +560,238 @@ pub const Editor = struct {
         self.paste_cr = byte == '\r';
         switch (byte) {
             '\r', '\n' => {
-                try self.document.buffer.insertNewline(self.allocator);
+                try self.document.buffer.insertNewline(self.document.allocator);
                 self.changed();
             },
             '\t', 32...126, 128...255 => try self.insert(&.{byte}),
             else => {},
         }
+    }
+
+    fn cancelSearch(self: *Editor) void {
+        if (self.search_accept or self.search_next != null) self.message_len = 0;
+        self.search_accept = false;
+        self.search_next = null;
+        if (self.search_job) |job| job.cancel();
+    }
+
+    fn searchKey(self: *Editor, key: terminal.Key) !bool {
+        switch (key) {
+            .escape => self.search_prompt = false,
+            .byte => |byte| switch (byte) {
+                8, 127 => {
+                    if (self.search_text.items.len == 0) {
+                        self.search_prompt = false;
+                    } else {
+                        var end = self.search_text.items.len - 1;
+                        while (end > 0 and self.search_text.items[end] & 0xc0 == 0x80) end -= 1;
+                        self.search_text.shrinkRetainingCapacity(end);
+                    }
+                },
+                '\r', '\n' => {
+                    self.search_prompt = false;
+                    if (self.search_text.items.len != 0) {
+                        try self.last_search.ensureTotalCapacity(self.allocator, self.search_text.items.len);
+                        self.last_search.clearRetainingCapacity();
+                        self.last_search.appendSliceAssumeCapacity(self.search_text.items);
+                    }
+                    try self.requestSearch();
+                },
+                32...126 => try self.appendSearchText(&.{byte}),
+                else => {},
+            },
+            .text => |text| try self.appendSearchText(text.bytes[0..text.len]),
+            else => {},
+        }
+        return false;
+    }
+
+    fn appendSearchText(self: *Editor, text: []const u8) !void {
+        if (self.search_text.items.len + text.len > search.max_query_size) {
+            self.setMessage("Search is limited to {d} bytes", .{search.max_query_size});
+            return;
+        }
+        try self.search_text.appendSlice(self.allocator, text);
+    }
+
+    fn requestSearch(self: *Editor) !void {
+        if (self.search_accept or self.search_next != null) return;
+        if (self.last_search.items.len == 0) {
+            self.setMessage("No previous search", .{});
+            return;
+        }
+        if (self.workspace != null and self.current_file == null) {
+            self.setMessage("No file under cursor", .{});
+            return;
+        }
+        if (self.stream) |*stream| stream.async_load = true;
+        self.search_next = .{
+            .file_count = if (self.workspace) |workspace| workspace.entries.items.len else 1,
+            .origin_file = self.current_file orelse 0,
+            .origin_offset = self.document.buffer.cursor,
+            .origin_row = self.document.buffer.cursor_row,
+            .current_file_only = self.isVisual(),
+            .cell = searchCell,
+            .projected_line = if (self.search_projection != null and self.projection_document == self.document and
+                self.projection_revision == self.currentRevision()) .{
+                .file = self.current_file orelse 0,
+                .revision = self.projection_revision,
+                .line_start = self.search_projection.?.line_start,
+                .line_end = self.search_projection.?.line_end,
+            } else null,
+        };
+        self.setMessage("Searching...", .{});
+        try self.pollBackground();
+    }
+
+    fn searchSource(self: *Editor, request: search.Request, destination: []u8) search.Source {
+        const revision = if (self.workspace) |workspace|
+            workspace.entries.items[request.file].revision
+        else
+            self.document_revision;
+        if (request.revision) |expected| if (expected != revision) return .{ .unavailable = error.ContentChanged };
+        const document = if (self.workspace) |workspace|
+            workspace.entries.items[request.file].document
+        else
+            self.document;
+        if (document) |doc| {
+            const bytes = doc.buffer.bytes.items;
+            if (request.offset > bytes.len) return .{ .unavailable = error.ContentChanged };
+            const count = @min(destination.len, bytes.len - request.offset);
+            @memcpy(destination[0..count], bytes[request.offset..][0..count]);
+            return .{ .resident = .{ .len = count, .total_size = bytes.len, .revision = revision } };
+        }
+        const entry = &self.workspace.?.entries.items[request.file];
+        if (entry.load_error) |err| return .{ .unavailable = err };
+        return .{ .disk = .{ .path = entry.path, .revision = revision } };
+    }
+
+    fn pollBackground(self: *Editor) !void {
+        if (self.workspace) |workspace| {
+            if (try workspace.pollRequested()) self.background_redraw = true;
+        }
+        if (self.search_job) |job| {
+            _ = job.service(self, searchSource);
+            if (job.isDone()) {
+                var result = job.takeResult();
+                defer result.deinit();
+                const options = job.options;
+                job.deinit();
+                self.search_job = null;
+                if (self.search_accept) {
+                    self.search_accept = false;
+                    self.background_redraw = true;
+                    if (result.failure) |err| {
+                        if (err == error.ContentChanged or err == error.SourceChanged) {
+                            self.search_next = options;
+                        } else self.setMessage("Search failed: {s}", .{@errorName(err)});
+                    } else if (result.match) |*found| {
+                        const revision = if (self.workspace) |workspace|
+                            workspace.entries.items[found.file].revision
+                        else
+                            self.document_revision;
+                        if (revision != found.revision) {
+                            // Residency or edits changed while the worker read.
+                            // Retry against current authoritative content.
+                            self.search_next = options;
+                        } else {
+                            try self.acceptMatch(found);
+                            if (result.skipped != 0) {
+                                self.setMessage("{s} ({d} files skipped)", .{
+                                    @as([]const u8, if (found.wrapped) "Search wrapped" else "Match"), result.skipped,
+                                });
+                            } else self.setMessage("{s}", .{@as([]const u8, if (found.wrapped) "Search wrapped" else "Match")});
+                        }
+                    } else if (result.skipped != 0) {
+                        self.setMessage("Search incomplete: {d} files skipped", .{result.skipped});
+                    } else self.setMessage("Pattern not found", .{});
+                }
+            }
+        }
+        if (self.search_job == null) {
+            if (self.search_next) |options| {
+                self.search_next = null;
+                self.search_job = search.Job.start(self.allocator, self.last_search.items, options) catch |err| {
+                    self.setMessage("Search failed: {s}", .{@errorName(err)});
+                    self.background_redraw = true;
+                    return;
+                };
+                self.search_accept = true;
+            }
+        }
+    }
+
+    fn acceptMatch(self: *Editor, found: *search.Match) !void {
+        if (self.workspace) |workspace| {
+            workspace.cancelRequested();
+            const previous_active = workspace.active_index;
+            workspace.active_index = found.file;
+            errdefer workspace.active_index = previous_active;
+            if (found.document) |document| {
+                self.document = try workspace.adopt(found.file, document, found.line_count.?);
+                found.document = null;
+            } else self.document = workspace.entries.items[found.file].document.?;
+            self.current_file = found.file;
+            self.filename = workspace.entries.items[found.file].name;
+            self.dirty = workspace.entries.items[found.file].dirty;
+        }
+        // The scanner already counted these rows. setCursor would scan the
+        // entire prefix again on the input thread for a distant match.
+        self.document.buffer.cursor = found.offset;
+        self.document.buffer.cursor_row = found.row;
+        self.document.buffer.preferred_column = null;
+        const reuse = found.projection == null and self.search_projection != null and
+            self.projection_document == self.document and self.projection_revision == self.currentRevision() and
+            found.offset >= self.search_projection.?.line_start and found.offset <= self.search_projection.?.line_end;
+        if (!reuse) {
+            self.clearProjection();
+            self.search_projection = found.projection;
+            found.projection = null;
+        }
+        self.projection_document = self.document;
+        self.projection_revision = self.currentRevision();
+        self.screen_row = 0;
+        self.left_column = 0;
+        self.transitions +%= 1;
+    }
+
+    fn searchCell(bytes: []const u8, column: usize) search.Cell {
+        const cell = display.cell(bytes, column);
+        return .{ .len = cell.len, .width = cell.width };
+    }
+
+    fn currentRevision(self: *const Editor) u64 {
+        return if (self.current_file) |index| self.workspace.?.entries.items[index].revision else self.document_revision;
+    }
+
+    fn clearProjection(self: *Editor) void {
+        if (self.search_projection) |*projection| projection.deinit();
+        self.search_projection = null;
+        self.projection_document = null;
+    }
+
+    fn lineStart(self: *const Editor, position: usize) usize {
+        if (self.search_projection) |projection| {
+            if (position >= projection.line_start and position <= projection.line_end) return projection.line_start;
+        }
+        return self.document.buffer.lineStart(position);
+    }
+
+    fn cursorColumn(self: *const Editor) usize {
+        const cursor = self.document.buffer.cursor;
+        if (self.search_projection) |projection| {
+            if (cursor >= projection.line_start and cursor <= projection.line_end) {
+                var low: usize = 0;
+                var high = projection.anchors.len;
+                while (low + 1 < high) {
+                    const middle = low + (high - low) / 2;
+                    if (projection.anchors[middle].offset <= cursor) low = middle else high = middle;
+                }
+                const anchor = projection.anchors[low];
+                return display.columnsFrom(self.document.buffer.bytes.items[anchor.offset..cursor], anchor.column);
+            }
+        }
+        return display.columns(self.document.buffer.bytes.items[self.lineStart(cursor)..cursor]);
     }
 
     fn commandKey(self: *Editor, key: terminal.Key) !bool {
@@ -611,6 +887,11 @@ pub const Editor = struct {
     /// Prepare the same complete frame used by the terminal loop, without I/O.
     /// The returned bytes are borrowed until the next frame or deinit.
     pub fn renderFrame(self: *Editor, size: terminal.Size) ![]const u8 {
+        if (self.search_projection != null and
+            (self.projection_document != self.document or self.projection_revision != self.currentRevision())) self.clearProjection();
+        const async_workspace = if (self.stream != null and self.stream.?.async_load) self.workspace else null;
+        if (async_workspace) |workspace| workspace.beginFrame();
+        defer if (async_workspace) |workspace| workspace.endFrame();
         self.frame.clearRetainingCapacity();
         try self.append("\x1b[?2026h\x1b[?25l\x1b[0m");
         if (size.rows < 3 or size.cols < 2) {
@@ -618,16 +899,15 @@ pub const Editor = struct {
             return self.frame.items;
         }
         const buffer = &self.document.buffer;
-        const bytes = buffer.bytes.items;
         self.height = size.rows - 2;
         self.screen_row = @min(self.screen_row, self.height - 1);
         if (self.stream) |*stream| self.wrap = try stream.canWrap(self.height);
         const cursor_row = buffer.cursor_row;
-        const cursor_column = display.columns(bytes[buffer.lineStart(buffer.cursor)..buffer.cursor]);
+        const cursor_column = self.cursorColumn();
         if (cursor_column < self.left_column) self.left_column = cursor_column;
         if (cursor_column >= self.left_column + size.cols) self.left_column = cursor_column - size.cols + 1;
 
-        var first = Row{ .file = self.current_file orelse 0, .start = buffer.lineStart(buffer.cursor) };
+        var first = Row{ .file = self.current_file orelse 0, .start = self.lineStart(buffer.cursor) };
         var back: usize = 0;
         while (back < self.screen_row) : (back += 1) {
             first = try self.stepRow(first, false) orelse break;
@@ -639,9 +919,13 @@ pub const Editor = struct {
             if (visible) |line| {
                 var rendered = line;
                 if (!line.gap) {
-                    const document = if (self.workspace) |workspace| try workspace.ensure(line.file) else self.document;
-                    const start = document.buffer.lineStart(@min(line.start, document.buffer.bytes.items.len));
-                    const end = document.buffer.lineEnd(start);
+                    const document = if (self.workspace) |workspace|
+                        if (async_workspace != null) (try workspace.request(line.file)).? else try workspace.ensure(line.file)
+                    else
+                        self.document;
+                    const start = if (document == self.document) self.lineStart(@min(line.start, document.buffer.bytes.items.len)) else document.buffer.lineStart(@min(line.start, document.buffer.bytes.items.len));
+                    const projection = if (document == self.document and self.search_projection != null and self.search_projection.?.line_start == start) self.search_projection else null;
+                    const end = if (projection) |prepared| prepared.line_end else document.buffer.lineEnd(start);
                     rendered.end = end;
                     if (self.workspace == null or line.file == self.current_file) {
                         try self.drawLine(start, end, size.cols);
@@ -673,7 +957,11 @@ pub const Editor = struct {
         if (prefix.len < size.cols) try self.drawText(self.filename, 0, size.cols - prefix.len);
         try self.append("\x1b[0m");
         try self.print("\x1b[{d};1H\x1b[2K", .{size.rows});
-        if (self.command_active) {
+        if (self.search_prompt) {
+            try self.append("/");
+            const columns = display.columns(self.search_text.items);
+            try self.drawText(self.search_text.items, columns -| (size.cols - 2), size.cols - 1);
+        } else if (self.command_active) {
             try self.append(":");
             const offset = self.command.items.len -| (size.cols - 2);
             try self.append(self.command.items[offset..]);
@@ -687,9 +975,11 @@ pub const Editor = struct {
             else if (self.pending_operator != null)
                 " Motion or repeat operator; Escape cancels"
             else
-                " i insert   v/V select   yy yank   p paste   :w all   :wt file   :q quit", 0, size.cols);
+                " i insert   / search   n next   v/V select   :w all   :wt file   :q quit", 0, size.cols);
         }
-        if (self.command_active) {
+        if (self.search_prompt) {
+            try self.print("\x1b[{d};{d}H\x1b[6 q", .{ size.rows, @min(display.columns(self.search_text.items) + 2, size.cols) });
+        } else if (self.command_active) {
             try self.print("\x1b[{d};{d}H\x1b[6 q", .{ size.rows, @min(self.command.items.len + 2, size.cols) });
         } else {
             try self.print("\x1b[{d};{d}H", .{ self.screen_row + 1, cursor_column - self.left_column + 1 });
@@ -700,7 +990,10 @@ pub const Editor = struct {
     }
 
     fn stepRow(self: *Editor, row: Row, forward: bool) !?Row {
-        if (self.stream) |*stream| return stream.step(row, forward, self.wrap);
+        if (self.stream) |*stream| return stream.step(row, forward, self.wrap) catch |err| switch (err) {
+            error.LoadPending => null,
+            else => return err,
+        };
         const buffer = &self.document.buffer;
         if (forward) {
             const end = row.end orelse buffer.lineEnd(row.start);
@@ -712,11 +1005,21 @@ pub const Editor = struct {
     fn drawLine(self: *Editor, start: usize, end: usize, width: usize) !void {
         const bytes = self.document.buffer.bytes.items[start..end];
         const selected = self.selection();
-        try self.drawStyledText(bytes, self.left_column, width, selected, start);
+        const projection = if (self.search_projection != null and self.search_projection.?.line_start == start) self.search_projection else null;
+        if (projection) |prepared| {
+            var low: usize = 0;
+            var high = prepared.anchors.len;
+            while (low + 1 < high) {
+                const middle = low + (high - low) / 2;
+                if (prepared.anchors[middle].column <= self.left_column) low = middle else high = middle;
+            }
+            const anchor = prepared.anchors[low];
+            try self.drawStyledTextFrom(self.document.buffer.bytes.items[anchor.offset..end], self.left_column, width, selected, anchor.offset, anchor.column);
+        } else try self.drawStyledText(bytes, self.left_column, width, selected, start);
         if (selected) |range| {
-            const column = display.columns(bytes);
+            const column = if (projection) |prepared| prepared.total_columns else display.columns(bytes);
             const line_selected = range.linewise and start >= range.start and
-                start <= self.document.buffer.lineStart(@max(self.anchor, self.document.buffer.cursor));
+                start <= self.lineStart(@max(self.anchor, self.document.buffer.cursor));
             const newline_selected = !range.linewise and end >= range.start and end < range.end;
             if (line_selected or (newline_selected and column >= self.left_column)) {
                 const used = column -| self.left_column;
@@ -734,8 +1037,12 @@ pub const Editor = struct {
     }
 
     fn drawStyledText(self: *Editor, bytes: []const u8, left: usize, width: usize, selected: ?Range, offset: usize) !void {
+        return self.drawStyledTextFrom(bytes, left, width, selected, offset, 0);
+    }
+
+    fn drawStyledTextFrom(self: *Editor, bytes: []const u8, left: usize, width: usize, selected: ?Range, offset: usize, initial_column: usize) !void {
         var index: usize = 0;
-        var column: usize = 0;
+        var column: usize = initial_column;
         var visible_base = false;
         var highlighted = false;
         while (index < bytes.len) {
@@ -1108,4 +1415,151 @@ test "page movement includes separators between short files" {
     _ = try editor.handle(.page_up);
     try std.testing.expectEqual(@as(?usize, 0), editor.current_file);
     try std.testing.expectEqual(@as(usize, 0), editor.screen_row);
+}
+
+fn finishSearch(editor: *Editor) !void {
+    var timer = try std.time.Timer.start();
+    while (editor.search_job != null or editor.search_next != null) {
+        if (timer.read() > 5 * std.time.ns_per_s) return error.SearchDidNotFinish;
+        _ = try editor.handle(.tick);
+        std.Thread.sleep(100 * std.time.ns_per_us);
+    }
+}
+
+test "workspace scanning neither admits buffers nor changes cache recency" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    for (0..20) |index| {
+        var name: [32]u8 = undefined;
+        try temp.dir.writeFile(.{ .sub_path = try std.fmt.bufPrint(&name, "file{d:0>2}", .{index}), .data = "ordinary text\n" });
+    }
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    var editor = try Editor.initWorkspace(std.testing.allocator, &workspace);
+    defer editor.deinit();
+    _ = try workspace.ensure(1);
+    _ = try workspace.ensure(2);
+    const clock_before = workspace.clock;
+    const entries_before = try std.testing.allocator.dupe(@TypeOf(workspace.entries.items[0]), workspace.entries.items);
+    defer std.testing.allocator.free(entries_before);
+    try typeKeys(&editor, "/absent\r");
+    try finishSearch(&editor);
+    try std.testing.expectEqualStrings("Pattern not found", editor.message[0..editor.message_len]);
+    try std.testing.expectEqual(clock_before, workspace.clock);
+    try std.testing.expectEqual(@as(usize, 3), workspace.resident.items.len);
+    for (entries_before, workspace.entries.items) |before, after| {
+        try std.testing.expectEqual(before.document, after.document);
+        try std.testing.expectEqual(before.last_used, after.last_used);
+        try std.testing.expectEqual(before.line_count, after.line_count);
+        try std.testing.expectEqual(before.revision, after.revision);
+        try std.testing.expectEqual(before.load_error, after.load_error);
+    }
+}
+
+test "a completed search cannot jump after the user starts editing" {
+    var doc = try testingDocument("first second");
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "unused");
+    defer editor.deinit();
+    try typeKeys(&editor, "/second\r");
+    const job = editor.search_job.?;
+    var timer = try std.time.Timer.start();
+    while (!job.isDone()) {
+        if (timer.read() > 5 * std.time.ns_per_s) return error.SearchDidNotFinish;
+        _ = job.service(&editor, Editor.searchSource);
+        std.Thread.sleep(100 * std.time.ns_per_us);
+    }
+    try typeKeys(&editor, "iX");
+    try finishSearch(&editor);
+    try std.testing.expectEqual(Mode.insert, editor.mode);
+    try std.testing.expectEqual(@as(usize, 1), doc.buffer.cursor);
+    try std.testing.expectEqualStrings("Xfirst second", doc.buffer.bytes.items);
+}
+
+test "search prepares only the matching document and preserves editable ownership" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = "origin" });
+    try temp.dir.writeFile(.{ .sub_path = "b", .data = "no occurrence" });
+    try temp.dir.writeFile(.{ .sub_path = "c", .data = "one\r\ntwo\r\nneedle" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    var editor = try Editor.initWorkspace(std.testing.allocator, &workspace);
+    defer editor.deinit();
+    try typeKeys(&editor, "/needle\r");
+    try finishSearch(&editor);
+    try std.testing.expect(workspace.entries.items[1].document == null);
+    try std.testing.expectEqual(@as(?usize, 2), editor.current_file);
+    try std.testing.expectEqual(@as(usize, 10), editor.document.buffer.cursor);
+    try std.testing.expectEqual(@as(usize, 2), editor.document.buffer.cursor_row);
+    try std.testing.expectEqual(@as(?usize, 3), workspace.entries.items[2].line_count);
+    try typeKeys(&editor, "iX\x1b");
+    try std.testing.expectEqualStrings("one\r\ntwo\r\nXneedle", editor.document.buffer.bytes.items);
+    try std.testing.expect(workspace.entries.items[2].dirty);
+}
+
+test "asynchronous rendering leaves pending documents to the loader" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = "origin" });
+    try temp.dir.writeFile(.{ .sub_path = "b", .data = "neighbor" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    var editor = try Editor.initWorkspace(std.testing.allocator, &workspace);
+    defer editor.deinit();
+    editor.stream.?.async_load = true;
+    _ = try editor.renderFrame(.{ .rows = 5, .cols = 40 });
+    try std.testing.expect(workspace.hasPendingRequest());
+    try std.testing.expect(workspace.entries.items[1].document == null);
+    try std.testing.expectEqual(@as(?usize, 0), editor.current_file);
+    // Even after the worker finishes, rendering itself cannot admit its result.
+    while (!workspace.requested.?.isDone()) std.Thread.sleep(100 * std.time.ns_per_us);
+    _ = try editor.renderFrame(.{ .rows = 5, .cols = 40 });
+    try std.testing.expect(workspace.entries.items[1].document == null);
+    _ = try editor.handle(.tick);
+    const frame = try editor.renderFrame(.{ .rows = 5, .cols = 40 });
+    try std.testing.expect(std.mem.indexOf(u8, frame, "neighbor") != null);
+}
+
+test "long-line search retains correct display anchors across redraw and resize" {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(std.testing.allocator);
+    try bytes.appendNTimes(std.testing.allocator, 'a', search.chunk_size * 8 + 1);
+    try bytes.appendSlice(std.testing.allocator, "\t界 needle tail\r\nnext");
+    var doc = try testingDocument(bytes.items);
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "long-line");
+    defer editor.deinit();
+    try typeKeys(&editor, "/needle\r");
+    try finishSearch(&editor);
+    const offset = std.mem.indexOf(u8, bytes.items, "needle").?;
+    const column = display.columns(bytes.items[0..offset]);
+    try std.testing.expectEqual(offset, doc.buffer.cursor);
+    try std.testing.expectEqual(column, editor.cursorColumn());
+    try std.testing.expect(editor.search_projection.?.anchors.len > 1);
+    const anchors = editor.search_projection.?.anchors.ptr;
+    for ([_]u16{ 80, 30, 120 }) |width| {
+        const frame = try editor.renderFrame(.{ .rows = 5, .cols = width });
+        var expected: [64]u8 = undefined;
+        try std.testing.expect(std.mem.indexOf(u8, frame, try std.fmt.bufPrint(&expected, "1:{d}", .{column + 1})) != null);
+        try std.testing.expectEqual(anchors, editor.search_projection.?.anchors.ptr);
+    }
+    try typeKeys(&editor, ":");
+    _ = try editor.renderFrame(.{ .rows = 5, .cols = 80 });
+    try std.testing.expectEqual(anchors, editor.search_projection.?.anchors.ptr);
+    try typeKeys(&editor, "\x1bn");
+    try finishSearch(&editor);
+    try std.testing.expectEqualStrings("Search wrapped", editor.message[0..editor.message_len]);
+    try std.testing.expectEqual(anchors, editor.search_projection.?.anchors.ptr);
+    try typeKeys(&editor, "h");
+    _ = try editor.renderFrame(.{ .rows = 5, .cols = 80 });
+    try std.testing.expectEqual(column - 1, editor.cursorColumn());
+    try typeKeys(&editor, "iX");
+    try std.testing.expect(editor.search_projection == null);
 }
