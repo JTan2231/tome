@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const terminal = @import("terminal.zig");
-const Workspace = @import("workspace.zig").Workspace;
+const Workspace = @import("content").Workspace;
 const Editor = @import("editor.zig").Editor;
 
 const usage =
@@ -86,11 +86,8 @@ fn run() !void {
 }
 
 test {
-    _ = @import("buffer.zig");
-    _ = @import("storage.zig");
     _ = @import("terminal.zig");
     _ = @import("display.zig");
     _ = @import("editor.zig");
-    _ = @import("workspace.zig");
     _ = @import("stream.zig");
 }

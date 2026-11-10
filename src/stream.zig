@@ -1,6 +1,6 @@
 const std = @import("std");
-const Workspace = @import("workspace.zig").Workspace;
-const Document = @import("storage.zig").Document;
+const Workspace = @import("content").Workspace;
+const Document = @import("content").Document;
 
 /// A separator belongs to the file above it, but is never an editing position.
 pub const Row = struct {
@@ -10,35 +10,17 @@ pub const Row = struct {
 };
 
 pub const Stream = struct {
-    allocator: std.mem.Allocator,
     workspace: *Workspace,
-    counts: []?usize,
 
-    pub fn init(allocator: std.mem.Allocator, workspace: *Workspace) !Stream {
-        const counts = try allocator.alloc(?usize, workspace.entries.items.len);
-        @memset(counts, null);
-        return .{ .allocator = allocator, .workspace = workspace, .counts = counts };
-    }
-
-    pub fn deinit(self: *Stream) void {
-        self.allocator.free(self.counts);
-    }
-
-    pub fn invalidate(self: *Stream, file: usize) void {
-        self.counts[file] = null;
+    pub fn init(workspace: *Workspace) Stream {
+        return .{ .workspace = workspace };
     }
 
     fn load(self: *Stream, file: usize) !?*Document {
-        const was_loaded = self.workspace.entries.items[file].document != null;
-        const document = self.workspace.ensure(file) catch |err| {
+        return self.workspace.ensure(file) catch |err| {
             if (err == error.OutOfMemory) return err;
-            self.counts[file] = 0;
             return null;
         };
-        if (!was_loaded or self.counts[file] == null) {
-            self.counts[file] = 1 + std.mem.count(u8, document.buffer.bytes.items, "\n");
-        }
-        return document;
     }
 
     /// Probe only enough files to decide whether content exceeds the viewport.
@@ -46,10 +28,12 @@ pub const Stream = struct {
     pub fn canWrap(self: *Stream, height: usize) !bool {
         var lines: usize = 0;
         const first = self.workspace.active_index orelse 0;
-        for (0..self.counts.len) |offset| {
-            const file = (first + offset) % self.counts.len;
-            if (self.counts[file] == null) _ = try self.load(file);
-            lines +|= self.counts[file] orelse 0;
+        const entries = self.workspace.entries.items;
+        for (0..entries.len) |offset| {
+            const file = (first + offset) % entries.len;
+            if (entries[file].load_error != null) continue;
+            if (entries[file].line_count == null) _ = try self.load(file);
+            lines +|= entries[file].line_count orelse 0;
             if (lines > height) return true;
         }
         return false;
@@ -111,8 +95,7 @@ test "file traversal preserves CRLF lines and separates files in both directions
     defer std.testing.allocator.free(root);
     var workspace = try Workspace.open(std.testing.allocator, root, null);
     defer workspace.deinit();
-    var stream = try Stream.init(std.testing.allocator, &workspace);
-    defer stream.deinit();
+    var stream = Stream.init(&workspace);
     const rows = [_]Row{
         .{ .file = 0 },
         .{ .file = 0, .start = 5 },
@@ -135,14 +118,12 @@ test "short workspaces stay finite and long content wraps after a separator" {
     defer std.testing.allocator.free(root);
     var workspace = try Workspace.open(std.testing.allocator, root, null);
     defer workspace.deinit();
-    var stream = try Stream.init(std.testing.allocator, &workspace);
-    defer stream.deinit();
+    var stream = Stream.init(&workspace);
     try std.testing.expect(!try stream.canWrap(2));
     try std.testing.expect(try stream.step(.{ .file = 0 }, true, false) == null);
     const doc = try workspace.ensure(0);
     try doc.buffer.insert(std.testing.allocator, "a\nb\n");
     workspace.markDirty(0);
-    stream.invalidate(0);
     try std.testing.expect(try stream.canWrap(2));
     try std.testing.expect(!try stream.canWrap(3));
     const last = Row{ .file = 0, .start = 4 };
@@ -158,15 +139,14 @@ test "large files are skipped without loading their contents" {
     defer temp.cleanup();
     try temp.dir.writeFile(.{ .sub_path = "a", .data = "a" });
     const huge = try temp.dir.createFile("b", .{});
-    try huge.setEndPos(@import("storage.zig").max_file_size + 1);
+    try huge.setEndPos(@import("content").max_file_size + 1);
     huge.close();
     try temp.dir.writeFile(.{ .sub_path = "c", .data = "c" });
     const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root);
     var workspace = try Workspace.open(std.testing.allocator, root, null);
     defer workspace.deinit();
-    var stream = try Stream.init(std.testing.allocator, &workspace);
-    defer stream.deinit();
+    var stream = Stream.init(&workspace);
     try std.testing.expectEqual(@as(?usize, 2), try stream.adjacent(0, true, false));
     try std.testing.expectEqual(@as(?usize, 0), try stream.adjacent(2, false, false));
     try std.testing.expect(workspace.entries.items[1].document == null);
@@ -186,8 +166,7 @@ test "wrap probing starts near the cursor and leaves distant files unloaded" {
     var workspace = try Workspace.open(std.testing.allocator, root, null);
     defer workspace.deinit();
     workspace.active_index = 1;
-    var stream = try Stream.init(std.testing.allocator, &workspace);
-    defer stream.deinit();
+    var stream = Stream.init(&workspace);
     try std.testing.expect(try stream.canWrap(2));
     try std.testing.expect(workspace.entries.items[0].document == null);
     try std.testing.expect(workspace.entries.items[1].document != null);
@@ -201,8 +180,7 @@ test "empty directories have no rows and cannot wrap" {
     defer std.testing.allocator.free(root);
     var workspace = try Workspace.open(std.testing.allocator, root, null);
     defer workspace.deinit();
-    var stream = try Stream.init(std.testing.allocator, &workspace);
-    defer stream.deinit();
+    var stream = Stream.init(&workspace);
     try std.testing.expect(!try stream.canWrap(22));
     try std.testing.expect(try stream.adjacent(0, true, true) == null);
     try std.testing.expect(try stream.step(.{ .file = 0 }, true, true) == null);

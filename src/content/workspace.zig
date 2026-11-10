@@ -8,6 +8,9 @@ pub const Entry = struct {
     name: []u8,
     path: []u8,
     document: ?*storage.Document = null,
+    // Retained after eviction so viewport probing need not reload distant files.
+    // A successful ensure refreshes it after loading or editing the document.
+    line_count: ?usize = null,
     dirty: bool = false,
     load_error: ?anyerror = null,
     last_used: u64 = 0,
@@ -135,6 +138,10 @@ pub const Workspace = struct {
         try self.entries.append(self.allocator, .{ .name = owned_name, .path = owned_path });
     }
 
+    /// Request one complete file's renderable content. Includes loading, newline
+    /// preparation, line counting, and cache trimming; excludes viewport layout
+    /// and rendering. The document is borrowed until eviction or deinit. Set
+    /// active_index to protect a document across requests for other files.
     pub fn ensure(self: *Workspace, index: usize) !*storage.Document {
         const entry = &self.entries.items[index];
         if (entry.load_error) |err| return err;
@@ -159,7 +166,12 @@ pub const Workspace = struct {
                 return error.FileNotFound;
             }
             entry.document = document;
+            // An evicted file may have changed on disk since its previous load.
+            entry.line_count = null;
             self.resident.appendAssumeCapacity(index);
+        }
+        if (entry.line_count == null) {
+            entry.line_count = 1 + std.mem.count(u8, entry.document.?.buffer.bytes.items, "\n");
         }
         self.clock +%= 1;
         entry.last_used = self.clock;
@@ -202,6 +214,7 @@ pub const Workspace = struct {
     pub fn markDirty(self: *Workspace, index: usize) void {
         std.debug.assert(self.entries.items[index].document != null);
         self.entries.items[index].dirty = true;
+        self.entries.items[index].line_count = null;
     }
 
     pub fn hasChanges(self: *const Workspace) bool {
@@ -273,7 +286,67 @@ test "catalog orders containers first recursively without reading file contents"
     for (workspace.entries.items, expected) |entry, name| {
         try std.testing.expectEqualStrings(name, entry.name);
         try std.testing.expect(entry.document == null);
+        try std.testing.expect(entry.line_count == null);
     }
+}
+
+test "request prepares newline style and line count before returning" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = "one\r\ntwo\r\n" });
+    try temp.dir.writeFile(.{ .sub_path = "empty", .data = "" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+
+    const document = try workspace.ensure(0);
+    try std.testing.expectEqualStrings("one\r\ntwo\r\n", document.buffer.bytes.items);
+    try std.testing.expectEqualStrings("\r\n", document.buffer.newline);
+    try std.testing.expectEqual(@as(?usize, 3), workspace.entries.items[0].line_count);
+    try std.testing.expectEqual(document, try workspace.ensure(0));
+    _ = try workspace.ensure(1);
+    try std.testing.expectEqual(@as(?usize, 1), workspace.entries.items[1].line_count);
+}
+
+test "editing invalidates preparation and a resident request refreshes it" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = "one" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+
+    const document = try workspace.ensure(0);
+    try std.testing.expectEqual(@as(?usize, 1), workspace.entries.items[0].line_count);
+    try document.buffer.insert(std.testing.allocator, "two\nthree\n");
+    workspace.markDirty(0);
+    try std.testing.expect(workspace.entries.items[0].line_count == null);
+    try std.testing.expectEqual(document, try workspace.ensure(0));
+    try std.testing.expectEqual(@as(?usize, 3), workspace.entries.items[0].line_count);
+}
+
+test "eviction retains line counts and reloading refreshes changed contents" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    for (0..cache_file_limit + 1) |index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "file{d:0>2}", .{index});
+        try temp.dir.writeFile(.{ .sub_path = name, .data = "one\n" });
+    }
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    for (0..workspace.entries.items.len) |index| _ = try workspace.ensure(index);
+    try std.testing.expect(workspace.entries.items[0].document == null);
+    try std.testing.expectEqual(@as(?usize, 2), workspace.entries.items[0].line_count);
+
+    try temp.dir.writeFile(.{ .sub_path = "file00", .data = "one\ntwo\nthree" });
+    const document = try workspace.ensure(0);
+    try std.testing.expectEqualStrings("one\ntwo\nthree", document.buffer.bytes.items);
+    try std.testing.expectEqual(@as(?usize, 3), workspace.entries.items[0].line_count);
 }
 
 test "clean cache is bounded and dirty documents survive eviction" {

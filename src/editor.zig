@@ -1,8 +1,8 @@
 const std = @import("std");
 const terminal = @import("terminal.zig");
-const storage = @import("storage.zig");
+const content = @import("content");
 const display = @import("display.zig");
-const Workspace = @import("workspace.zig").Workspace;
+const Workspace = content.Workspace;
 const Stream = @import("stream.zig").Stream;
 const Row = @import("stream.zig").Row;
 
@@ -12,7 +12,7 @@ const Range = struct { start: usize, end: usize, linewise: bool = false };
 
 pub const Editor = struct {
     allocator: std.mem.Allocator,
-    document: *storage.Document,
+    document: *content.Document,
     filename: []const u8,
     workspace: ?*Workspace = null,
     stream: ?Stream = null,
@@ -40,13 +40,12 @@ pub const Editor = struct {
     paste_cr: bool = false,
     paste_origin_row: ?usize = null,
 
-    pub fn init(allocator: std.mem.Allocator, document: *storage.Document, filename: []const u8) Editor {
+    pub fn init(allocator: std.mem.Allocator, document: *content.Document, filename: []const u8) Editor {
         return .{ .allocator = allocator, .document = document, .filename = filename };
     }
 
     pub fn initWorkspace(allocator: std.mem.Allocator, workspace: *Workspace) !Editor {
-        var stream = try Stream.init(allocator, workspace);
-        errdefer stream.deinit();
+        const stream = Stream.init(workspace);
         for (0..workspace.entries.items.len) |offset| {
             const index = (workspace.initial_index + offset) % workspace.entries.items.len;
             const document = workspace.ensure(index) catch |err| {
@@ -61,12 +60,12 @@ pub const Editor = struct {
             return editor;
         }
         // An empty directory can be browsed and quit without inventing a file.
-        const document = try allocator.create(storage.Document);
+        const document = try allocator.create(content.Document);
         errdefer allocator.destroy(document);
         document.* = .{
             .allocator = allocator,
             .path = try allocator.dupe(u8, ""),
-            .buffer = @import("buffer.zig").Buffer.init(.empty),
+            .buffer = content.Buffer.init(.empty),
             .is_new = false,
             .saved_stat = null,
         };
@@ -78,7 +77,6 @@ pub const Editor = struct {
     }
 
     pub fn deinit(self: *Editor) void {
-        if (self.stream) |*stream| stream.deinit();
         if (self.owns_document) {
             self.document.deinit();
             self.allocator.destroy(self.document);
@@ -492,7 +490,6 @@ pub const Editor = struct {
         self.dirty = true;
         if (self.current_file) |index| {
             self.workspace.?.markDirty(index);
-            self.stream.?.invalidate(index);
         }
         self.message_len = 0;
     }
@@ -767,7 +764,7 @@ pub const Editor = struct {
 };
 
 test "rendering never emits file control sequences" {
-    var doc: storage.Document = undefined;
+    var doc: content.Document = undefined;
     var editor = Editor.init(std.testing.allocator, &doc, "unused");
     defer editor.deinit();
     try editor.drawText("hello\x1b[2J\x00\xff", 0, 80);
@@ -775,21 +772,21 @@ test "rendering never emits file control sequences" {
 }
 
 test "horizontal clipping does not emit half a wide character" {
-    var doc: storage.Document = undefined;
+    var doc: content.Document = undefined;
     var editor = Editor.init(std.testing.allocator, &doc, "unused");
     defer editor.deinit();
     try editor.drawText("界x", 1, 2);
     try std.testing.expectEqualStrings(" x", editor.frame.items);
 }
 
-fn testingDocument(text: []const u8) !storage.Document {
+fn testingDocument(text: []const u8) !content.Document {
     const allocator = std.testing.allocator;
     const path = try allocator.dupe(u8, "unused");
     errdefer allocator.free(path);
     return .{
         .allocator = allocator,
         .path = path,
-        .buffer = @import("buffer.zig").Buffer.init(.fromOwnedSlice(try allocator.dupe(u8, text))),
+        .buffer = content.Buffer.init(.fromOwnedSlice(try allocator.dupe(u8, text))),
         .is_new = true,
         .saved_stat = null,
     };

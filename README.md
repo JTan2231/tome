@@ -138,12 +138,35 @@ macOS is the initial tested platform. The same source also builds for Linux.
 On macOS the binary uses the OS's libSystem; there are no third-party runtime
 libraries. Terminal sequences are documented in [Ghostty's VT reference](https://ghostty.org/docs/vt).
 
+## Code and measurement
+
+`src/content/` is the shared content module: file storage, editable buffers,
+workspace discovery, caching, and preparation for rendering. `Workspace.ensure`
+is the per-file request-to-ready boundary. It returns after the buffer, newline
+style, and line count are available and cache eviction has completed. The editor,
+viewport traversal, display formatting, and terminal I/O remain in `src/`.
+
+`measurement/` contains a separate harness that calls this same boundary without
+starting the editor or terminal. It measures one requested file with a monotonic
+clock and reports a JSON record after timing has stopped:
+
+```sh
+zig build measure -Doptimize=ReleaseSafe -- notes.txt
+```
+
+Discovery and result reporting are outside the interval. This measures complete
+file readiness, rather than readiness of an entire viewport. The reusable harness
+also supports requests against an existing workspace, distinguishing buffer hits,
+loads, and remembered load failures. It does not control the OS file cache.
+There are no benchmark scenarios, statistical summaries, or performance thresholds
+yet. See [the measurement contract and usage](measurement/README.md).
+
 ## Check
 
 ```sh
 zig build test
 python3 tests/pty_smoke.py
-zig fmt --check build.zig src/*.zig
+zig fmt --check build.zig src measurement
 ```
 
 The Python script uses only Python's standard library and drives the built binary
