@@ -96,6 +96,7 @@ pub const Job = struct {
     options: Options,
     query: [max_query_size]u8 = undefined,
     query_len: usize,
+    query_newlines: usize,
     prefix: [max_query_size]usize = undefined,
     thread: ?std.Thread = null,
     cancelled: std.atomic.Value(bool) = .init(false),
@@ -114,7 +115,12 @@ pub const Job = struct {
         if (options.file_count == 0 or options.origin_file >= options.file_count) return error.NoFiles;
         const self = try allocator.create(Job);
         errdefer allocator.destroy(self);
-        self.* = .{ .allocator = allocator, .options = options, .query_len = query.len };
+        self.* = .{
+            .allocator = allocator,
+            .options = options,
+            .query_len = query.len,
+            .query_newlines = std.mem.count(u8, query, "\n"),
+        };
         @memcpy(self.query[0..query.len], query);
         self.prefix[0] = 0;
         var matched: usize = 0;
@@ -453,12 +459,22 @@ const Matcher = struct {
     offset: usize = 0,
     row: usize = 0,
     matched: usize = 0,
-    rows: [max_query_size]usize = undefined,
 
     fn feed(self: *Matcher, bytes: []const u8) ?Found {
         const query = self.job.query[0..self.job.query_len];
-        for (bytes) |byte| {
-            self.rows[self.offset % query.len] = self.row;
+        var index: usize = 0;
+        while (index < bytes.len) : (index += 1) {
+            if (self.matched == 0) {
+                // No candidate is in progress, so skip directly to its first
+                // byte. Count skipped newlines without running KMP per byte.
+                const remaining = bytes[index..];
+                const skipped = std.mem.indexOfScalar(u8, remaining, query[0]) orelse remaining.len;
+                self.row += std.mem.count(u8, remaining[0..skipped], "\n");
+                self.offset += skipped;
+                index += skipped;
+                if (index == bytes.len) return null;
+            }
+            const byte = bytes[index];
             if (byte == '\n') self.row += 1;
             while (self.matched > 0 and byte != query[self.matched]) self.matched = self.job.prefix[self.matched - 1];
             if (byte == query[self.matched]) self.matched += 1;
@@ -466,7 +482,9 @@ const Matcher = struct {
             if (self.matched == query.len) {
                 const start = self.offset - query.len;
                 self.matched = self.job.prefix[self.matched - 1];
-                if (start >= self.lower and start < self.upper) return .{ .offset = start, .row = self.rows[start % query.len] };
+                // A complete match contains exactly the query's newlines.
+                // Undo their contribution to recover the row at its start.
+                if (start >= self.lower and start < self.upper) return .{ .offset = start, .row = self.row - self.job.query_newlines };
             }
         }
         return null;
@@ -702,6 +720,53 @@ test "overlapping matches start after the cursor and wrap prefix is bounded" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.match.?.offset);
     try std.testing.expect(!result.match.?.wrapped);
+}
+
+test "match rows account for query newlines and repeated prefixes" {
+    const Case = struct { text: []const u8, query: []const u8 };
+    const cases = [_]Case{
+        .{ .text = "before\n\nneedleafter", .query = "\nneedle" },
+        .{ .text = "before\nneedle\nend", .query = "needle\n" },
+        .{ .text = "before\nneedle\nmiddle\nend", .query = "needle\nmiddle\n" },
+        .{ .text = "before\nab\nab\nab\nac\nend", .query = "ab\nab\nac\n" },
+        .{ .text = "before\naaaaabaaaaabaaaac", .query = "aaaac" },
+        .{ .text = "before\nab\nfailed\nabac\nend", .query = "abac" },
+        .{ .text = "before\nend", .query = "\n" },
+        .{ .text = "\nneedle\nend", .query = "\nneedle\n" },
+    };
+    for (cases) |case| {
+        const files = [_]TestSources.TestFile{.{ .text = case.text }};
+        var sources: TestSources = .{ .files = &files };
+        const job = try Job.start(std.testing.allocator, case.query, .{ .file_count = 1, .origin_file = 0, .origin_offset = 0 });
+        defer job.deinit();
+        var result = try sources.finish(job);
+        defer result.deinit();
+        const expected = std.mem.indexOf(u8, case.text, case.query).?;
+        try std.testing.expectEqual(expected, result.match.?.offset);
+        try std.testing.expectEqual(std.mem.count(u8, case.text[0..expected], "\n"), result.match.?.row);
+        try std.testing.expectEqual(expected == 0, result.match.?.wrapped);
+    }
+}
+
+test "multiline match rows survive chunk boundaries and prefix fallback" {
+    const text = try std.testing.allocator.alloc(u8, chunk_size + 32);
+    defer std.testing.allocator.free(text);
+    @memset(text, 'x');
+    @memcpy(text[0..6], "a\r\nb\n\n");
+    const target = "ab\nab\nac\n";
+    const at = chunk_size - 2;
+    // The extra prefix starts a candidate that fails after the chunk boundary.
+    @memcpy(text[at - 3 .. at], "ab\n");
+    @memcpy(text[at..][0..target.len], target);
+    const files = [_]TestSources.TestFile{.{ .text = text }};
+    var sources: TestSources = .{ .files = &files };
+    const job = try Job.start(std.testing.allocator, target, .{ .file_count = 1, .origin_file = 0, .origin_offset = 0 });
+    defer job.deinit();
+    var result = try sources.finish(job);
+    defer result.deinit();
+    try std.testing.expectEqual(at, result.match.?.offset);
+    try std.testing.expectEqual(@as(usize, 4), result.match.?.row);
+    try std.testing.expectEqual(@as(usize, 2), sources.requests);
 }
 
 test "unavailable files are skipped once and missing matches complete" {

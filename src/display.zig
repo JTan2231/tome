@@ -11,6 +11,7 @@ pub const Cell = struct {
 pub fn cell(bytes: []const u8, column: usize) Cell {
     std.debug.assert(bytes.len != 0);
     const first = bytes[0];
+    if (first >= 0x20 and first < 0x7f) return .{ .len = 1, .width = 1, .kind = .text };
     if (first == '\t') return .{ .len = 1, .width = 4 - column % 4, .kind = .tab };
     if (first < 0x20 or first == 0x7f) return .{ .len = 1, .width = 2, .kind = .control };
     const len = std.unicode.utf8ByteSequenceLength(first) catch return replacement();
@@ -72,4 +73,22 @@ test "display widths and terminal controls" {
     try std.testing.expectEqual(@as(usize, 2), columns("\x1b"));
     try std.testing.expect(cell("\x1b", 0).kind == .control);
     try std.testing.expectEqual(@as(usize, 1), columns("\xff"));
+}
+
+test "ASCII boundaries preserve controls, tabs, and UTF8 display cells" {
+    const cases = [_]struct { bytes: []const u8, column: usize = 0, expected: Cell }{
+        .{ .bytes = " ", .expected = .{ .len = 1, .width = 1, .kind = .text } },
+        .{ .bytes = "~", .expected = .{ .len = 1, .width = 1, .kind = .text } },
+        .{ .bytes = "\x1f", .expected = .{ .len = 1, .width = 2, .kind = .control } },
+        .{ .bytes = "\x7f", .expected = .{ .len = 1, .width = 2, .kind = .control } },
+        .{ .bytes = "\t", .column = 1, .expected = .{ .len = 1, .width = 3, .kind = .tab } },
+        .{ .bytes = "\t", .column = 4, .expected = .{ .len = 1, .width = 4, .kind = .tab } },
+        .{ .bytes = "\x80", .expected = .{ .len = 1, .width = 1, .kind = .replacement } },
+        .{ .bytes = "\xc2", .expected = .{ .len = 1, .width = 1, .kind = .replacement } },
+        .{ .bytes = "\u{80}", .expected = .{ .len = 2, .width = 1, .kind = .replacement } },
+        .{ .bytes = "界", .expected = .{ .len = 3, .width = 2, .kind = .text } },
+        .{ .bytes = "\u{301}", .expected = .{ .len = 2, .width = 0, .kind = .text } },
+    };
+    for (cases) |case| try std.testing.expectEqualDeep(case.expected, cell(case.bytes, case.column));
+    try std.testing.expectEqual(@as(usize, 9), columnsFrom(" ~\t界e\u{301}\x1b", 1));
 }
