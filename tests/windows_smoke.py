@@ -249,8 +249,24 @@ class Editor:
     def close(self):
         if self.process.hProcess:
             if WaitForSingleObject(self.process.hProcess, 0) != 0:
-                TerminateProcess(self.process.hProcess, 1)
-                WaitForSingleObject(self.process.hProcess, 5000)
+                if self.reader:
+                    try:
+                        self.send(b"\x1b")
+                        time.sleep(0.1)
+                        self.send(b":q!\r")
+                    except OSError:
+                        pass
+                if WaitForSingleObject(self.process.hProcess, 3000) != 0:
+                    # The wrapper waits for tome. Kill its whole process tree on
+                    # a hung test so the child cannot retain temporary files.
+                    try:
+                        subprocess.run(["taskkill", "/PID", str(self.process.dwProcessId),
+                                        "/T", "/F"], capture_output=True, timeout=10)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                    if WaitForSingleObject(self.process.hProcess, 5000) != 0:
+                        TerminateProcess(self.process.hProcess, 1)
+                        WaitForSingleObject(self.process.hProcess, 5000)
             CloseHandle(self.process.hProcess)
             self.process.hProcess = None
         if self.console:
@@ -283,7 +299,9 @@ def main():
             editor.send(b":q\r", b"Unsaved")
             assert not path.exists(), "editing wrote the file before :w"
             editor.save()
-            assert path.read_bytes() == "h\u00e9\u03bb\U0001f600\nworld".encode()
+            actual = path.read_bytes()
+            expected = "h\u00e9\u03bb\U0001f600\nworld".encode()
+            assert actual == expected, f"saved bytes: {actual!r}; expected: {expected!r}; output: {bytes(editor.output[-3000:])!r}"
             editor.quit()
         path = directory / "existing.txt"
         path.write_bytes(b"alpha\r\nbeta\r\n")
@@ -296,7 +314,9 @@ def main():
             editor.send(b"\x1b[C")  # Right from column 1 to column 2.
             editor.insert(b"*")
             editor.save()
-            assert path.read_bytes() == b"zero\r\n>a*lpha!\r\nbeta\r\n"
+            actual = path.read_bytes()
+            expected = b"zero\r\n>a*lpha!\r\nbeta\r\n"
+            assert actual == expected, f"saved bytes: {actual!r}; expected: {expected!r}; output: {bytes(editor.output[-3000:])!r}"
             editor.quit()
         with Editor(binary, directory) as editor:
             editor.quit()
