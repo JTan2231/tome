@@ -117,7 +117,7 @@ def open_console(name, mode):
     if handle == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        descriptor = msvcrt.open_osfhandle(handle, os.O_BINARY)
+        descriptor = msvcrt.open_osfhandle(handle, os.O_BINARY | os.O_RDWR)
     except BaseException:
         CloseHandle(handle)
         raise
