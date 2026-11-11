@@ -10,6 +10,7 @@ https://learn.microsoft.com/windows/console/creating-a-pseudoconsole-session
 """
 
 import ctypes
+import os
 from ctypes import wintypes as wt
 from pathlib import Path
 import subprocess
@@ -21,6 +22,8 @@ import time
 
 if sys.platform != "win32":
     raise SystemExit("windows_smoke.py requires Windows (use pty_smoke.py on POSIX)")
+
+import msvcrt
 
 kernel = ctypes.WinDLL("kernel32", use_last_error=True)
 HANDLE = wt.HANDLE
@@ -84,6 +87,9 @@ GetExitCodeProcess = bind("GetExitCodeProcess", wt.BOOL, HANDLE, ctypes.POINTER(
 WaitForSingleObject = bind("WaitForSingleObject", wt.DWORD, HANDLE, wt.DWORD)
 TerminateProcess = bind("TerminateProcess", wt.BOOL, HANDLE, wt.UINT)
 GetStdHandle = bind("GetStdHandle", HANDLE, wt.DWORD)
+SetStdHandle = bind("SetStdHandle", wt.BOOL, wt.DWORD, HANDLE)
+CreateFile = bind("CreateFileW", HANDLE, wt.LPCWSTR, wt.DWORD, wt.DWORD,
+                  LPVOID, wt.DWORD, wt.DWORD, HANDLE)
 GetConsoleMode = bind("GetConsoleMode", wt.BOOL, HANDLE, ctypes.POINTER(wt.DWORD))
 GetConsoleCP = bind("GetConsoleCP", wt.UINT)
 GetConsoleOutputCP = bind("GetConsoleOutputCP", wt.UINT)
@@ -103,15 +109,35 @@ def console_state():
     return (*modes, GetConsoleCP(), GetConsoleOutputCP())
 
 
+def open_console(name, mode):
+    # CI's redirected standard handles can survive ConPTY attachment. These
+    # device names open this process's attached console regardless of redirection.
+    # Both access bits are needed by GetConsoleMode/SetConsoleMode.
+    handle = CreateFile(name, 0xc0000000, 3, None, 3, 0, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_BINARY)
+    except BaseException:
+        CloseHandle(handle)
+        raise
+    return os.fdopen(descriptor, mode, buffering=0)
+
+
 def console_child(binary, path):
-    before = console_state()
-    result = subprocess.run([binary, path], cwd=str(Path(path).parent))
-    after = console_state()
-    if result.returncode != 0:
-        raise SystemExit(result.returncode)
-    if after != before:
-        raise AssertionError(f"console state not restored: {before} -> {after}")
-    print("TOME_CONSOLE_RESTORED", flush=True)
+    with open_console("CONIN$", "rb") as input_file, open_console("CONOUT$", "wb") as output_file:
+        check(SetStdHandle((-10) & 0xffffffff, msvcrt.get_osfhandle(input_file.fileno())))
+        for identifier in (-11, -12):
+            check(SetStdHandle(identifier & 0xffffffff, msvcrt.get_osfhandle(output_file.fileno())))
+        before = console_state()
+        result = subprocess.run([binary, path], cwd=str(Path(path).parent),
+                                stdin=input_file, stdout=output_file, stderr=output_file)
+        after = console_state()
+        if result.returncode != 0:
+            raise SystemExit(result.returncode)
+        if after != before:
+            raise AssertionError(f"console state not restored: {before} -> {after}")
+        output_file.write(b"TOME_CONSOLE_RESTORED\r\n")
 
 
 class Editor:

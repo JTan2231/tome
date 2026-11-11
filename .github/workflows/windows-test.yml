@@ -49,6 +49,14 @@ jobs:
         with:
           name: tome-windows-x86_64
           path: release
+      - name: Test cross-compiled editor in a Windows pseudoconsole
+        shell: pwsh
+        run: |
+          Expand-Archive release/tome-windows-x86_64.zip -DestinationPath release/unpacked
+          & ./release/unpacked/tome.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Help command failed' }
+          python tests/windows_smoke.py release/unpacked/tome.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Windows terminal smoke test failed' }
       - name: Install Zig 0.15.2
         shell: pwsh
         run: |
@@ -59,11 +67,3 @@ jobs:
           Join-Path $env:RUNNER_TEMP 'zig-x86_64-windows-0.15.2' | Out-File -FilePath $env:GITHUB_PATH -Append
       - name: Windows unit tests
         run: zig build test -Doptimize=ReleaseSafe --summary all
-      - name: Test cross-compiled editor in a Windows pseudoconsole
-        shell: pwsh
-        run: |
-          Expand-Archive release/tome-windows-x86_64.zip -DestinationPath release/unpacked
-          & ./release/unpacked/tome.exe --help
-          if ($LASTEXITCODE -ne 0) { throw 'Help command failed' }
-          python tests/windows_smoke.py release/unpacked/tome.exe
-          if ($LASTEXITCODE -ne 0) { throw 'Windows terminal smoke test failed' }
