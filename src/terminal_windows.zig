@@ -158,8 +158,8 @@ pub const Console = struct {
             const high = self.high_surrogate orelse return;
             scalar = 0x10000 + ((@as(u21, high) - 0xd800) << 10) + (scalar - 0xdc00);
         }
-        self.high_surrogate = null;
         if (scalar != 0) {
+            self.high_surrogate = null;
             self.encoded_len = std.unicode.utf8Encode(scalar, &self.encoded) catch return;
         } else {
             const sequence: []const u8 = switch (key.virtual_key) {
@@ -174,6 +174,7 @@ pub const Console = struct {
                 0x2e => "\x1b[3~", // Delete
                 else => return,
             };
+            self.high_surrogate = null;
             @memcpy(self.encoded[0..sequence.len], sequence);
             self.encoded_len = sequence.len;
         }
@@ -224,6 +225,14 @@ test "ConPTY Unicode Alt release records are text but ordinary releases are igno
     key.unicode = 0xd83d;
     console.encodeKey(key);
     try std.testing.expectEqual(null, console.takeEncoded());
+    // Console Unicode composition can emit an Alt press between the two
+    // surrogate releases. Ignored modifier records must retain the pair.
+    key.down = 1;
+    key.unicode = 0;
+    console.encodeKey(key);
+    try std.testing.expectEqual(null, console.takeEncoded());
+    try std.testing.expectEqual(@as(?u16, 0xd83d), console.high_surrogate);
+    key.down = 0;
     key.unicode = 0xde00;
     console.encodeKey(key);
     for ("😀") |byte| try std.testing.expectEqual(byte, console.takeEncoded().?);
