@@ -9,6 +9,7 @@ pub const search = @import("search.zig");
 
 test {
     _ = @import("buffer.zig");
+    _ = @import("history.zig");
     _ = @import("storage.zig");
     _ = @import("workspace.zig");
     _ = @import("search.zig");

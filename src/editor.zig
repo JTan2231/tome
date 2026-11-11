@@ -26,6 +26,7 @@ pub const Editor = struct {
     mode: Mode = .normal,
     anchor: usize = 0,
     pending_operator: ?Operator = null,
+    pending_g: bool = false,
     register: std.ArrayList(u8) = .empty,
     register_linewise: bool = false,
     register_valid: bool = false,
@@ -135,7 +136,7 @@ pub const Editor = struct {
         // Repeated n coalesces while a request is running. Every other input
         // supersedes its automatic jump before completed work is delivered.
         const repeat_search = !self.command_active and !self.search_prompt and
-            self.mode != .insert and self.pending_operator == null and
+            self.mode != .insert and self.pending_operator == null and !self.pending_g and
             key == .byte and key.byte == 'n';
         if (!repeat_search) self.cancelSearch();
         // A bracketed paste is one movement for viewport purposes. Avoid
@@ -160,12 +161,15 @@ pub const Editor = struct {
     fn handleKey(self: *Editor, key: terminal.Key) !bool {
         if (key == .paste_start) {
             self.pending_operator = null;
+            self.pending_g = false;
             self.pasting = true;
             self.accept_paste = self.mode == .insert and !self.command_active;
             self.paste_cr = false;
+            if (self.accept_paste) self.document.history.endChange();
             return false;
         }
         if (key == .paste_end) {
+            if (self.accept_paste) self.document.history.endChange();
             self.pasting = false;
             self.accept_paste = false;
             return false;
@@ -188,7 +192,25 @@ pub const Editor = struct {
             }
             return false;
         }
+        // Insert text is one undo step until movement, Escape, or a paste.
+        // Normal-mode edits each start a fresh step; change operators keep
+        // their deletion and following inserted text in the same step.
+        if (self.mode != .insert or switch (key) {
+            .escape, .up, .down, .left, .right, .home, .end, .page_up, .page_down => true,
+            else => false,
+        }) self.document.history.endChange();
         const buffer = &self.document.buffer;
+        if (self.pending_g) {
+            self.pending_g = false;
+            if (key != .byte or key.byte != 'g') {
+                self.pending_operator = null;
+                if (key == .escape) self.mode = .normal;
+                return false;
+            }
+        } else if (self.mode != .insert and key == .byte and key.byte == 'g') {
+            self.pending_g = true;
+            return false;
+        }
         if (self.pending_operator) |operator| {
             self.pending_operator = null;
             try self.operatorKey(operator, key);
@@ -197,24 +219,31 @@ pub const Editor = struct {
         if (try self.move(key, !self.isVisual())) return false;
         switch (key) {
             .escape => self.mode = .normal,
-            .delete => if (self.mode == .insert and buffer.deleteForward()) {
-                self.changed();
+            .delete => if (self.mode == .insert) {
+                if (buffer.cursor < buffer.bytes.items.len) {
+                    try self.beginChange();
+                    _ = buffer.deleteForward();
+                    self.changed();
+                }
             } else if (self.selection()) |range| {
                 try self.operate(.delete, range);
             },
             .byte => |byte| {
                 if (self.mode == .insert) switch (byte) {
-                    8, 127 => if (buffer.backspace()) {
+                    8, 127 => if (buffer.cursor > 0) {
+                        try self.beginChange();
+                        _ = buffer.backspace();
                         self.changed();
                     },
-                    '\r', '\n' => {
-                        try buffer.insertNewline(self.document.allocator);
-                        self.changed();
-                    },
+                    '\r', '\n' => try self.insert(buffer.newline),
                     '\t', 32...126 => try self.insert(&.{byte}),
                     else => {},
                 } else switch (byte) {
                     'i' => if (!self.isVisual()) {
+                        self.mode = .insert;
+                    },
+                    'a' => if (!self.isVisual()) {
+                        if (buffer.cursor < buffer.lineEnd(buffer.cursor)) buffer.moveRight();
                         self.mode = .insert;
                     },
                     'v' => self.toggleVisual(.visual),
@@ -250,6 +279,7 @@ pub const Editor = struct {
                         try self.operate(if (byte == 'D') .delete else .change, range);
                     },
                     'p', 'P' => try self.put(byte == 'P'),
+                    'u', 'r' => if (!self.isVisual()) self.restoreChange(byte == 'r'),
                     '/' => {
                         self.search_prompt = true;
                         self.search_text.clearRetainingCapacity();
@@ -309,7 +339,7 @@ pub const Editor = struct {
     }
 
     fn move(self: *Editor, key: terminal.Key, cross_files: bool) !bool {
-        const motion: enum { up, down, left, right, home, end, page_up, page_down } = switch (key) {
+        const motion: enum { up, down, left, right, home, end, file_home, file_end, page_up, page_down } = switch (key) {
             .up => .up,
             .down => .down,
             .left => .left,
@@ -327,11 +357,17 @@ pub const Editor = struct {
                     'l' => .right,
                     '0' => .home,
                     '$' => .end,
+                    'g' => .file_home,
+                    'G' => .file_end,
                     else => return false,
                 };
             },
             else => return false,
         };
+        if (motion == .file_home or motion == .file_end) {
+            try self.jumpFile(motion == .file_end, cross_files);
+            return true;
+        }
         if (motion == .page_up or motion == .page_down) {
             const screen_row = self.screen_row;
             var distance: usize = 0;
@@ -401,9 +437,26 @@ pub const Editor = struct {
             .right => buffer.moveRight(),
             .home => buffer.moveHome(),
             .end => buffer.moveEnd(),
-            .page_up, .page_down => unreachable,
+            .file_home, .file_end, .page_up, .page_down => unreachable,
         }
         return true;
+    }
+
+    fn jumpFile(self: *Editor, to_end: bool, cross_files: bool) anyerror!void {
+        const current = &self.document.buffer;
+        const boundary = if (to_end)
+            current.lineEnd(current.cursor) == current.bytes.items.len
+        else
+            current.cursor_row == 0;
+        const transition = self.transitions;
+        if (boundary and cross_files) _ = try self.move(if (to_end) .down else .up, true);
+        const buffer = &self.document.buffer;
+        var target = if (to_end) buffer.lineStart(buffer.bytes.items.len) else 0;
+        const end = buffer.lineEnd(target);
+        while (target < end and (buffer.bytes.items[target] == ' ' or buffer.bytes.items[target] == '\t')) : (target += 1) {}
+        buffer.setCursor(target);
+        self.left_column = 0;
+        if (self.transitions != transition) self.screen_row = if (to_end) self.height - 1 else 0;
     }
 
     fn operatorKey(self: *Editor, operator: Operator, key: terminal.Key) !void {
@@ -423,10 +476,11 @@ pub const Editor = struct {
         buffer.setCursor(origin);
         const linewise = switch (key) {
             .up, .down => true,
-            .byte => |byte| byte == 'j' or byte == 'k',
+            .byte => |byte| byte == 'j' or byte == 'k' or byte == 'g' or byte == 'G',
             else => false,
         };
-        if (linewise and origin == destination) return;
+        const file_motion = key == .byte and (key.byte == 'g' or key.byte == 'G');
+        if (linewise and origin == destination and !file_motion) return;
         try self.operate(operator, if (linewise) self.lineRange(origin, destination) else .{
             .start = @min(origin, destination),
             .end = @max(origin, destination),
@@ -469,6 +523,7 @@ pub const Editor = struct {
             }
         }
         if (!std.mem.eql(u8, bytes[start..range.end], replacement)) {
+            try self.beginChange();
             try buffer.replaceRange(self.document.allocator, start, range.end, replacement);
             self.changed();
         }
@@ -525,6 +580,7 @@ pub const Editor = struct {
             try pasted.appendSlice(self.allocator, buffer.newline);
         }
         if (!std.mem.eql(u8, bytes[start..end], pasted.items)) {
+            try self.beginChange();
             try buffer.replaceRange(self.document.allocator, start, end, pasted.items);
             self.changed();
         }
@@ -535,6 +591,22 @@ pub const Editor = struct {
             const after = start + pasted.items.len;
             buffer.setCursor(if (after > start) buffer.previousIndex(after) else start);
         }
+    }
+
+    fn beginChange(self: *Editor) !void {
+        try self.document.history.beginChange(self.document.allocator, &self.document.buffer);
+    }
+
+    fn restoreChange(self: *Editor, redo: bool) void {
+        const history = &self.document.history;
+        const restored = if (redo) history.redo(&self.document.buffer) else history.undo(&self.document.buffer);
+        if (!restored) {
+            self.setMessage("Nothing to {s}", .{if (redo) @as([]const u8, "redo") else "undo"});
+            return;
+        }
+        self.changed();
+        self.dirty = history.isDirty();
+        if (self.current_file) |index| self.workspace.?.entries.items[index].dirty = self.dirty;
     }
 
     fn changed(self: *Editor) void {
@@ -548,6 +620,8 @@ pub const Editor = struct {
     }
 
     fn insert(self: *Editor, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        try self.beginChange();
         try self.document.buffer.insert(self.document.allocator, bytes);
         self.changed();
     }
@@ -559,10 +633,7 @@ pub const Editor = struct {
         }
         self.paste_cr = byte == '\r';
         switch (byte) {
-            '\r', '\n' => {
-                try self.document.buffer.insertNewline(self.document.allocator);
-                self.changed();
-            },
+            '\r', '\n' => try self.insert(self.document.buffer.newline),
             '\t', 32...126, 128...255 => try self.insert(&.{byte}),
             else => {},
         }
@@ -1080,6 +1151,137 @@ pub const Editor = struct {
     }
 };
 
+test "undo groups insert sessions and change operators and restores redo" {
+    const cases = [_]struct { text: []const u8, setup: []const u8 = "", edit: []const u8, result: []const u8 }{
+        .{ .text = "ab", .edit = "iur\rX\x1b", .result = "ur\nXab" },
+        .{ .text = "one\r\ntwo", .setup = "j", .edit = "ccnew\x1b", .result = "one\r\nnew" },
+        .{ .text = "one\ntwo", .setup = "l", .edit = "Cnew\x1b", .result = "onew\ntwo" },
+        .{ .text = "aé界\r\nz", .setup = "lv", .edit = "ld", .result = "a\r\nz" },
+        .{ .text = "one\ntwo", .setup = "Yj", .edit = "p", .result = "one\ntwo\none\n" },
+        .{ .text = "abc\nfoo", .setup = "vlyjV", .edit = "p", .result = "abc\nab" },
+        .{ .text = "one\r\ntwo", .setup = "j", .edit = "dd", .result = "one" },
+    };
+    for (cases) |case| {
+        var doc = try testingDocument(case.text);
+        defer doc.deinit();
+        var editor = Editor.init(std.testing.allocator, &doc, "unused");
+        defer editor.deinit();
+        try typeKeys(&editor, case.setup);
+        try typeKeys(&editor, case.edit);
+        const cursor = doc.buffer.cursor;
+        try std.testing.expectEqualStrings(case.result, doc.buffer.bytes.items);
+        try std.testing.expect(editor.dirty);
+        try typeKeys(&editor, "u");
+        try std.testing.expectEqualStrings(case.text, doc.buffer.bytes.items);
+        try std.testing.expect(!editor.dirty);
+        try std.testing.expectEqual(Mode.normal, editor.mode);
+        try typeKeys(&editor, "r");
+        try std.testing.expectEqualStrings(case.result, doc.buffer.bytes.items);
+        try std.testing.expectEqual(cursor, doc.buffer.cursor);
+        try std.testing.expect(editor.dirty);
+    }
+}
+
+test "insert movement and bracketed paste separate undo steps" {
+    var doc = try testingDocument("é\r\nz");
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "unused");
+    defer editor.deinit();
+    try typeKeys(&editor, "iA");
+    _ = try editor.handle(.right);
+    _ = try editor.handle(.delete);
+    try typeKeys(&editor, "B\x1b");
+    try std.testing.expectEqualStrings("AéBz", doc.buffer.bytes.items);
+    try typeKeys(&editor, "u");
+    try std.testing.expectEqualStrings("Aé\r\nz", doc.buffer.bytes.items);
+    try std.testing.expectEqual(@as(usize, 3), doc.buffer.cursor);
+    try typeKeys(&editor, "u");
+    try std.testing.expectEqualStrings("é\r\nz", doc.buffer.bytes.items);
+    try typeKeys(&editor, "rr");
+    try std.testing.expectEqualStrings("AéBz", doc.buffer.bytes.items);
+
+    try typeKeys(&editor, "iQ");
+    _ = try editor.handle(.paste_start);
+    try typeKeys(&editor, "é\r\nP");
+    _ = try editor.handle(.paste_end);
+    try typeKeys(&editor, "R\x1bu");
+    try std.testing.expectEqualStrings("AéBQé\r\nPz", doc.buffer.bytes.items);
+    try typeKeys(&editor, "u");
+    try std.testing.expectEqualStrings("AéBQz", doc.buffer.bytes.items);
+    try typeKeys(&editor, "u");
+    try std.testing.expectEqualStrings("AéBz", doc.buffer.bytes.items);
+}
+
+test "undo steps preserve scalars and CRLF through insert deletion" {
+    var doc = try testingDocument("aé\r\nz");
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "unused");
+    defer editor.deinit();
+    try typeKeys(&editor, "ji\x7f\x7f\x1b");
+    try std.testing.expectEqualStrings("az", doc.buffer.bytes.items);
+    try typeKeys(&editor, "u");
+    try std.testing.expectEqualStrings("aé\r\nz", doc.buffer.bytes.items);
+    try std.testing.expectEqual(@as(usize, 5), doc.buffer.cursor);
+    try typeKeys(&editor, "r");
+    try std.testing.expectEqualStrings("az", doc.buffer.bytes.items);
+    try std.testing.expectEqual(@as(usize, 1), doc.buffer.cursor);
+}
+
+test "no-op edits keep redo and normal deletions undo individually" {
+    var doc = try testingDocument("abc");
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "unused");
+    defer editor.deinit();
+    try typeKeys(&editor, "xxu");
+    try std.testing.expectEqualStrings("bc", doc.buffer.bytes.items);
+    try typeKeys(&editor, "u");
+    try std.testing.expectEqualStrings("abc", doc.buffer.bytes.items);
+    try typeKeys(&editor, "i\x7f\x1b$D0r");
+    try std.testing.expectEqualStrings("bc", doc.buffer.bytes.items);
+    try typeKeys(&editor, "iX\x1br");
+    try std.testing.expectEqualStrings("Xbc", doc.buffer.bytes.items);
+    try std.testing.expectEqualStrings("Nothing to redo", editor.message[0..editor.message_len]);
+}
+
+test "workspace undo and redo update saved state revisions and line counts" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = "one\r\ntwo" });
+    try temp.dir.writeFile(.{ .sub_path = "b", .data = "other" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    var editor = try Editor.initWorkspace(std.testing.allocator, &workspace);
+    defer editor.deinit();
+    try typeKeys(&editor, "iA\r\x1b:wt\r");
+    try std.testing.expect(!workspace.hasChanges());
+    const saved_revision = workspace.entries.items[0].revision;
+    try typeKeys(&editor, "u");
+    try std.testing.expectEqualStrings("one\r\ntwo", editor.document.buffer.bytes.items);
+    try std.testing.expect(workspace.hasChanges());
+    try std.testing.expect(editor.dirty);
+    try std.testing.expect(workspace.entries.items[0].revision > saved_revision);
+    _ = try workspace.ensure(0);
+    try std.testing.expectEqual(@as(?usize, 2), workspace.entries.items[0].line_count);
+    try typeKeys(&editor, "r");
+    try std.testing.expect(!workspace.hasChanges());
+    try std.testing.expect(!editor.dirty);
+    _ = try workspace.ensure(0);
+    try std.testing.expectEqual(@as(?usize, 3), workspace.entries.items[0].line_count);
+    try typeKeys(&editor, "GGiB\x1b");
+    try std.testing.expectEqual(@as(?usize, 1), editor.current_file);
+    try typeKeys(&editor, "u");
+    try std.testing.expectEqualStrings("other", editor.document.buffer.bytes.items);
+    try std.testing.expect(!workspace.hasChanges());
+    try typeKeys(&editor, "ggr");
+    try std.testing.expectEqual(@as(?usize, 0), editor.current_file);
+    try std.testing.expectEqualStrings("A\r\none\r\ntwo", editor.document.buffer.bytes.items);
+    try typeKeys(&editor, "u");
+    try std.testing.expectEqualStrings("one\r\ntwo", editor.document.buffer.bytes.items);
+    try std.testing.expect(workspace.hasChanges());
+}
+
 test "rendering never emits file control sequences" {
     var doc: content.Document = undefined;
     var editor = Editor.init(std.testing.allocator, &doc, "unused");
@@ -1122,6 +1324,119 @@ fn expectStatusRow(editor: *Editor, row: usize) !void {
     var expected: [64]u8 = undefined;
     const status = try std.fmt.bufPrint(&expected, "  {d}:", .{row});
     try std.testing.expect(std.mem.indexOf(u8, frame, status) != null);
+}
+
+test "append enters insert after one scalar without crossing a line ending" {
+    const cases = [_]struct { text: []const u8, cursor: usize, result: []const u8 }{
+        .{ .text = "abc", .cursor = 0, .result = "aXbc" },
+        .{ .text = "é界", .cursor = 0, .result = "éX界" },
+        .{ .text = "é界", .cursor = 2, .result = "é界X" },
+        .{ .text = "abc", .cursor = 3, .result = "abcX" },
+        .{ .text = "a\r\nb", .cursor = 1, .result = "aX\r\nb" },
+        .{ .text = "\nb", .cursor = 0, .result = "X\nb" },
+        .{ .text = "", .cursor = 0, .result = "X" },
+    };
+    for (cases) |case| {
+        var doc = try testingDocument(case.text);
+        defer doc.deinit();
+        var editor = Editor.init(std.testing.allocator, &doc, "unused");
+        defer editor.deinit();
+        doc.buffer.setCursor(case.cursor);
+        try typeKeys(&editor, "a");
+        try std.testing.expectEqual(Mode.insert, editor.mode);
+        try std.testing.expect(!editor.dirty);
+        try typeKeys(&editor, "X\x1b");
+        try std.testing.expectEqualStrings(case.result, doc.buffer.bytes.items);
+    }
+}
+
+test "file motions use the first nonblank and g prefixes survive ticks and cancel" {
+    var doc = try testingDocument("  first\r\nmiddle\r\n\tlast");
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "unused");
+    defer editor.deinit();
+    try typeKeys(&editor, "jG");
+    try std.testing.expectEqual(@as(usize, 18), doc.buffer.cursor);
+    try typeKeys(&editor, "g");
+    _ = try editor.handle(.tick);
+    try std.testing.expect(editor.pending_g);
+    try std.testing.expectEqual(@as(usize, 2), doc.buffer.cursor_row);
+    try typeKeys(&editor, "g");
+    try std.testing.expectEqual(@as(usize, 2), doc.buffer.cursor);
+    try typeKeys(&editor, "gG");
+    try std.testing.expect(!editor.pending_g);
+    try std.testing.expectEqual(@as(usize, 2), doc.buffer.cursor);
+    try typeKeys(&editor, "vg\x1b");
+    try std.testing.expectEqual(Mode.normal, editor.mode);
+    try typeKeys(&editor, "iagG\x1b");
+    try std.testing.expectEqualStrings("  agGfirst\r\nmiddle\r\n\tlast", doc.buffer.bytes.items);
+}
+
+test "file border motions visit the same border of readable neighbors and honor wrapping" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = " a1\n a2" });
+    const huge = try temp.dir.createFile("b", .{});
+    try huge.setEndPos(content.max_file_size + 1);
+    huge.close();
+    try temp.dir.writeFile(.{ .sub_path = "c", .data = " c1\n c2" });
+    try temp.dir.writeFile(.{ .sub_path = "d", .data = "" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    var editor = try Editor.initWorkspace(std.testing.allocator, &workspace);
+    defer editor.deinit();
+    try typeKeys(&editor, "ggG");
+    try std.testing.expectEqual(@as(?usize, 0), editor.current_file);
+    try std.testing.expectEqual(@as(usize, 5), editor.document.buffer.cursor);
+    try typeKeys(&editor, "G");
+    try std.testing.expectEqual(@as(?usize, 2), editor.current_file);
+    try std.testing.expectEqual(@as(usize, 5), editor.document.buffer.cursor);
+    try typeKeys(&editor, "GG");
+    try std.testing.expectEqual(@as(?usize, 3), editor.current_file);
+    try std.testing.expectEqual(@as(usize, 0), editor.document.buffer.cursor);
+    try typeKeys(&editor, "gg");
+    try std.testing.expectEqual(@as(?usize, 2), editor.current_file);
+    try std.testing.expectEqual(@as(usize, 1), editor.document.buffer.cursor);
+    try typeKeys(&editor, "gg");
+    try std.testing.expectEqual(@as(?usize, 0), editor.current_file);
+    try std.testing.expectEqual(@as(usize, 1), editor.document.buffer.cursor);
+    editor.height = 1;
+    try typeKeys(&editor, "gg");
+    try std.testing.expectEqual(@as(?usize, 3), editor.current_file);
+    try typeKeys(&editor, "G");
+    try std.testing.expectEqual(@as(?usize, 0), editor.current_file);
+    try std.testing.expectEqual(@as(usize, 5), editor.document.buffer.cursor);
+    try std.testing.expect(!workspace.hasChanges());
+}
+
+test "file motions extend visual selections and operators stay in the current file" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = "one\ntwo\nthree" });
+    try temp.dir.writeFile(.{ .sub_path = "b", .data = "neighbor" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    var editor = try Editor.initWorkspace(std.testing.allocator, &workspace);
+    defer editor.deinit();
+    try typeKeys(&editor, "VGGy");
+    try std.testing.expectEqualStrings("one\ntwo\nthree", editor.register.items);
+    try std.testing.expectEqual(@as(?usize, 0), editor.current_file);
+    try typeKeys(&editor, "Vggggy");
+    try std.testing.expectEqualStrings("one\n", editor.register.items);
+    try typeKeys(&editor, "ygg");
+    try std.testing.expectEqualStrings("one\n", editor.register.items);
+    try typeKeys(&editor, "jdgg");
+    try std.testing.expectEqualStrings("three", editor.document.buffer.bytes.items);
+    try std.testing.expectEqualStrings("one\ntwo\n", editor.register.items);
+    try typeKeys(&editor, "dG");
+    try std.testing.expectEqualStrings("", editor.document.buffer.bytes.items);
+    try std.testing.expectEqualStrings("three", editor.register.items);
+    try std.testing.expectEqual(@as(?usize, 0), editor.current_file);
+    try std.testing.expectEqualStrings("neighbor", (try workspace.ensure(1)).buffer.bytes.items);
 }
 
 test "status row follows edits, bracketed paste, and paging" {

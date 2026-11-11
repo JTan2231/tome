@@ -11,8 +11,11 @@ const usage =
     \\Files load near the cursor; long workspaces scroll in a loop.
     \\
     \\  i       enter insert mode
+    \\  a       append after the current character (within the line)
     \\  Escape  return to normal mode
     \\  hjkl    move in normal/visual mode (arrows work in any mode)
+    \\  gg / G  first / last line; at that border, previous / next file
+    \\  u / r   undo / redo the current file in normal mode
     \\  v / V   select characters / whole lines (Shift+V)
     \\  o       swap ends of a visual selection
     \\  y       yank selection; yy or Y yanks a line in normal mode
@@ -20,7 +23,7 @@ const usage =
     \\  d / c   delete / change selection; dd / cc operate on a line
     \\  x       delete a character or selection
     \\  D / C   delete / change through end of line
-    \\  y/d/c + hjkl, 0, $, arrows, Home, End operate on a motion
+    \\  y/d/c + hjkl, 0, $, gg, G, arrows, Home, End operate on a motion
     \\  /text   search forward (literal, case-sensitive; Enter starts)
     \\  n       next match; Escape cancels a pending search
     \\  :w      write all changed files
@@ -38,14 +41,17 @@ pub fn main() void {
 }
 
 fn run() !void {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) {
-        @compileError("tome currently supports macOS and Linux terminals");
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux and builtin.os.tag != .windows) {
+        @compileError("tome supports macOS, Linux, and Windows terminals");
     }
     const allocator = std.heap.page_allocator;
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
     if (args.len == 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))) {
-        try (std.fs.File{ .handle = std.posix.STDOUT_FILENO }).writeAll(usage);
+        try (std.fs.File{ .handle = if (builtin.os.tag == .windows)
+            try std.os.windows.GetStdHandle(std.os.windows.STD_OUTPUT_HANDLE)
+        else
+            std.posix.STDOUT_FILENO }).writeAll(usage);
         return;
     }
     if (args.len > 2) {
@@ -60,11 +66,16 @@ fn run() !void {
     var root: []const u8 = cwd;
     var initial_file = initial;
     if (initial) |path| {
-        const stat = std.fs.cwd().statFile(path) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
+        const is_directory = classify: {
+            const stat = std.fs.cwd().statFile(path) catch |err| switch (err) {
+                error.FileNotFound => break :classify false,
+                // Windows statFile opens a file-only handle.
+                error.IsDir => break :classify true,
+                else => return err,
+            };
+            break :classify stat.kind == .directory;
         };
-        if (stat != null and stat.?.kind == .directory) {
+        if (is_directory) {
             root = path;
             initial_file = null;
         } else if (!std.mem.startsWith(u8, path, cwd) or

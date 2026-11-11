@@ -1,5 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Buffer = @import("buffer.zig").Buffer;
+const History = @import("history.zig").History;
 
 /// A simple in-memory editor deliberately limits the amount read at once.
 pub const max_file_size = 64 * 1024 * 1024;
@@ -8,6 +10,7 @@ pub const Document = struct {
     allocator: std.mem.Allocator,
     path: []u8,
     buffer: Buffer,
+    history: History = .{},
     is_new: bool,
     saved_stat: ?std.fs.File.Stat,
 
@@ -62,6 +65,7 @@ pub const Document = struct {
     }
 
     pub fn deinit(self: *Document) void {
+        self.history.deinit(self.allocator);
         self.buffer.deinit(self.allocator);
         self.allocator.free(self.path);
         self.* = undefined;
@@ -84,12 +88,15 @@ pub const Document = struct {
         const file = atomic.file_writer.file;
         try file.writeAll(self.buffer.bytes.items);
         // chmod after creation avoids the umask stripping existing permission bits.
-        if (self.saved_stat) |stat| try file.chmod(stat.mode & 0o777);
+        if (builtin.os.tag != .windows) {
+            if (self.saved_stat) |stat| try file.chmod(stat.mode & 0o777);
+        }
         try file.sync();
         try self.checkUnchanged();
         try atomic.finish();
         self.saved_stat = try statOrMissing(self.path);
         self.is_new = false;
+        self.history.markSaved();
     }
 
     fn checkUnchanged(self: *const Document) !void {
@@ -106,6 +113,22 @@ pub const Document = struct {
 fn statOrMissing(path: []const u8) !?std.fs.File.Stat {
     // The stored path was resolved on open. Refuse a new symlink introduced
     // afterwards rather than replacing that link on save.
+    if (builtin.os.tag == .windows) {
+        const windows = std.os.windows;
+        const path_w = try windows.sliceToPrefixedFileW(null, path);
+        const handle = windows.OpenFile(path_w.span(), .{
+            .access_mask = windows.FILE_READ_ATTRIBUTES,
+            .creation = windows.FILE_OPEN,
+            .filter = .any,
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        const file = std.fs.File{ .handle = handle };
+        defer file.close();
+        return try file.stat();
+    }
     const stat = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -169,6 +192,7 @@ test "file created after opening an absent path is not overwritten" {
 }
 
 test "save follows existing symlink and retains target permission bits" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var temp = std.testing.tmpDir(.{});
     defer temp.cleanup();
     const target = try temp.dir.createFile("target", .{ .mode = 0o640 });
@@ -198,8 +222,32 @@ test "nonregular files and dangling symlinks are rejected" {
     const directory = try tempPath(std.testing.allocator, temp.dir, ".");
     defer std.testing.allocator.free(directory);
     try std.testing.expectError(error.NotRegularFile, Document.open(std.testing.allocator, directory));
-    try temp.dir.symLink("absent", "dangling", .{});
+    temp.dir.symLink("absent", "dangling", .{}) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
     const link = try tempPath(std.testing.allocator, temp.dir, "dangling");
     defer std.testing.allocator.free(link);
     try std.testing.expectError(error.DanglingSymlink, Document.open(std.testing.allocator, link));
+}
+
+test "save refuses a symlink introduced after opening" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "original", .data = "original" });
+    try temp.dir.writeFile(.{ .sub_path = "other", .data = "untouched" });
+    const path = try tempPath(std.testing.allocator, temp.dir, "original");
+    defer std.testing.allocator.free(path);
+    var doc = try Document.open(std.testing.allocator, path);
+    defer doc.deinit();
+    try doc.buffer.insert(std.testing.allocator, "edited");
+    try temp.dir.deleteFile("original");
+    temp.dir.symLink("other", "original", .{}) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    try std.testing.expectError(error.FileChangedOnDisk, doc.save());
+    const bytes = try temp.dir.readFileAlloc(std.testing.allocator, "other", 1024);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("untouched", bytes);
 }

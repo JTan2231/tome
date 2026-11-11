@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const storage = @import("storage.zig");
 const Loader = @import("loader.zig").Job;
 
@@ -299,7 +300,7 @@ pub const Workspace = struct {
         }
     }
 
-    /// Dirty buffers and the active/requested documents are never evicted.
+    /// Dirty buffers, undo histories, and active/requested documents are retained.
     /// A single large active file can therefore exceed the clean-cache budget.
     fn trim(self: *Workspace, requested: usize) void {
         while (true) {
@@ -309,7 +310,7 @@ pub const Workspace = struct {
             for (self.resident.items) |index| {
                 const entry = self.entries.items[index];
                 const document = entry.document.?;
-                if (entry.dirty or document.is_new) continue;
+                if (entry.dirty or document.is_new or document.history.items.items.len != 0) continue;
                 count += 1;
                 bytes += document.buffer.bytes.capacity;
                 if (index == requested or self.active_index == index or
@@ -365,8 +366,8 @@ fn entryLessThan(_: void, a: Entry, b: Entry) bool {
     var left = a.name;
     var right = b.name;
     while (true) {
-        const a_slash = std.mem.indexOfScalar(u8, left, '/');
-        const b_slash = std.mem.indexOfScalar(u8, right, '/');
+        const a_slash = std.mem.indexOfScalar(u8, left, std.fs.path.sep);
+        const b_slash = std.mem.indexOfScalar(u8, right, std.fs.path.sep);
         const a_part = left[0 .. a_slash orelse left.len];
         const b_part = right[0 .. b_slash orelse right.len];
         if (!std.mem.eql(u8, a_part, b_part)) {
@@ -510,7 +511,10 @@ test "catalog orders containers first recursively without reading file contents"
     try temp.dir.makePath(".git");
     for ([_][]const u8{ "z/deep/x", "z/a", "a/z", "a/a", "a.txt", ".hidden", ".git/ignored" }) |path|
         try temp.dir.writeFile(.{ .sub_path = path, .data = "content" });
-    try temp.dir.symLink(".", "loop", .{ .is_directory = true });
+    temp.dir.symLink(".", "loop", .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied => if (builtin.os.tag != .windows) return err,
+        else => return err,
+    };
     const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root);
     var workspace = try Workspace.open(std.testing.allocator, root, null);
@@ -518,7 +522,10 @@ test "catalog orders containers first recursively without reading file contents"
     const expected = [_][]const u8{ "a/a", "a/z", "z/deep/x", "z/a", ".hidden", "a.txt" };
     try std.testing.expectEqual(expected.len, workspace.entries.items.len);
     for (workspace.entries.items, expected) |entry, name| {
-        try std.testing.expectEqualStrings(name, entry.name);
+        const native_name = try std.testing.allocator.dupe(u8, name);
+        defer std.testing.allocator.free(native_name);
+        std.mem.replaceScalar(u8, native_name, '/', std.fs.path.sep);
+        try std.testing.expectEqualStrings(native_name, entry.name);
         try std.testing.expect(entry.document == null);
         try std.testing.expect(entry.line_count == null);
     }
@@ -623,6 +630,36 @@ test "clean cache is bounded and dirty documents survive eviction" {
     try std.testing.expect(workspace.resident.items.len <= cache_file_limit);
 }
 
+test "saved documents retain undo history under cache pressure" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    for (0..20) |index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "file{d:0>2}", .{index});
+        try temp.dir.writeFile(.{ .sub_path = name, .data = "content" });
+    }
+    const root = try temp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    var workspace = try Workspace.open(allocator, root, null);
+    defer workspace.deinit();
+    const first = try workspace.ensure(0);
+    try first.history.beginChange(allocator, &first.buffer);
+    try first.buffer.insert(allocator, "edited ");
+    workspace.markDirty(0);
+    try workspace.save(0);
+    try std.testing.expect(!first.history.isDirty());
+    for (1..20) |index| _ = try workspace.ensure(index);
+    try std.testing.expectEqual(first, workspace.entries.items[0].document.?);
+    try std.testing.expect(workspace.entries.items[1].document == null);
+    try std.testing.expect(first.history.undo(&first.buffer));
+    try std.testing.expectEqualStrings("content", first.buffer.bytes.items);
+    try std.testing.expect(first.history.isDirty());
+    try std.testing.expect(first.history.redo(&first.buffer));
+    try std.testing.expectEqualStrings("edited content", first.buffer.bytes.items);
+    try std.testing.expect(!first.history.isDirty());
+}
+
 test "save all preserves failed edits and still writes other changed files" {
     var temp = std.testing.tmpDir(.{});
     defer temp.cleanup();
@@ -666,6 +703,24 @@ test "explicit missing file starts at its sorted position and saves on write all
     const result = workspace.saveAll();
     try std.testing.expectEqual(@as(usize, 1), result.saved);
     try std.testing.expectEqual(@as(u64, 0), (try temp.dir.statFile("new")).size);
+}
+
+test "explicit nested missing file keeps directories ahead of root files" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.makeDir("z");
+    try temp.dir.writeFile(.{ .sub_path = "a.txt", .data = "root file" });
+    try temp.dir.writeFile(.{ .sub_path = "z/z.txt", .data = "nested file" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const initial = try std.fs.path.join(std.testing.allocator, &.{ root, "z", "a.txt" });
+    defer std.testing.allocator.free(initial);
+    var workspace = try Workspace.open(std.testing.allocator, root, initial);
+    defer workspace.deinit();
+    try std.testing.expectEqual(@as(usize, 3), workspace.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), workspace.initial_index);
+    try std.testing.expectEqualStrings(initial, workspace.entries.items[0].path);
+    try std.testing.expectEqualStrings("a.txt", workspace.entries.items[2].name);
 }
 
 test "byte budget evicts clean buffers before the file-count limit" {
@@ -720,7 +775,10 @@ test "empty directory stays empty and explicit symlink reuses its target" {
     try std.testing.expectEqual(@as(usize, 0), empty.entries.items.len);
     try std.testing.expect(!empty.hasChanges());
     try temp.dir.writeFile(.{ .sub_path = "target", .data = "contents" });
-    try temp.dir.symLink("target", "link", .{});
+    temp.dir.symLink("target", "link", .{}) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
     const link = try std.fs.path.join(std.testing.allocator, &.{ root, "link" });
     defer std.testing.allocator.free(link);
     var workspace = try Workspace.open(std.testing.allocator, root, link);

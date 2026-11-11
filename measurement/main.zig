@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Workspace = @import("content").Workspace;
 const file_ready = @import("measurement");
 
@@ -23,7 +24,10 @@ fn run() !bool {
     const allocator = std.heap.page_allocator;
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
-    const stdout = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
+    const stdout = std.fs.File{ .handle = if (builtin.os.tag == .windows)
+        try std.os.windows.GetStdHandle(std.os.windows.STD_OUTPUT_HANDLE)
+    else
+        std.posix.STDOUT_FILENO };
     if (args.len == 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))) {
         try stdout.writeAll(usage);
         return false;

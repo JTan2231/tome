@@ -1,0 +1,68 @@
+name: Windows testing build
+
+on:
+  push:
+    tags: ['testing-windows-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cross-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Zig 0.15.2
+        run: |
+          curl --fail --location --retry 3 https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz -o zig.tar.xz
+          echo '02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239  zig.tar.xz' | sha256sum --check
+          tar -xf zig.tar.xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
+      - name: Cross-compile Windows x64
+        run: zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe
+      - name: Package
+        run: |
+          mkdir release
+          cp zig-out/bin/tome.exe README.md release/
+          cd release
+          zip ../tome-windows-x86_64.zip tome.exe README.md
+          cd ..
+          sha256sum tome-windows-x86_64.zip > SHA256SUMS.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tome-windows-x86_64
+          path: |
+            tome-windows-x86_64.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+  windows-test:
+    needs: cross-build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tome-windows-x86_64
+          path: release
+      - name: Install Zig 0.15.2
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'zig.zip'
+          Invoke-WebRequest https://ziglang.org/download/0.15.2/zig-x86_64-windows-0.15.2.zip -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -ne '3a0ed1e8799a2f8ce2a6e6290a9ff22e6906f8227865911fb7ddedc3cc14cb0c') { throw 'Zig checksum mismatch' }
+          Expand-Archive $archive -DestinationPath $env:RUNNER_TEMP
+          Join-Path $env:RUNNER_TEMP 'zig-x86_64-windows-0.15.2' | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Windows unit tests
+        run: zig build test -Doptimize=ReleaseSafe --summary all
+      - name: Test cross-compiled editor in a Windows pseudoconsole
+        shell: pwsh
+        run: |
+          Expand-Archive release/tome-windows-x86_64.zip -DestinationPath release/unpacked
+          & ./release/unpacked/tome.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Help command failed' }
+          python tests/windows_smoke.py release/unpacked/tome.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Windows terminal smoke test failed' }

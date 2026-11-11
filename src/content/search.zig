@@ -2,6 +2,7 @@
 //! supplies small copies of resident text through a nonblocking mailbox.
 //! Neither scanning nor destination preparation touches the workspace cache.
 const std = @import("std");
+const builtin = @import("builtin");
 const storage = @import("storage.zig");
 
 pub const chunk_size = 64 * 1024;
@@ -288,8 +289,7 @@ pub const Job = struct {
         try self.checkCancelled();
         // Nonblocking/no-follow open prevents a replaced catalog entry (FIFO or
         // symlink) from turning a regular-file search into an unbounded wait.
-        const fd = try std.posix.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOFOLLOW = true }, 0);
-        const file = std.fs.File{ .handle = fd };
+        const file = try openSearchFile(path);
         defer file.close();
         const before = try file.stat();
         if (before.kind != .file) return error.NotRegularFile;
@@ -410,6 +410,34 @@ pub const Job = struct {
         }
     }
 };
+
+// A Windows reparse-point handle must be opened synchronously for File.read.
+// std.os.windows.OpenFile intentionally omits synchronous I/O for no-follow
+// handles, so use CreateFileW without FILE_FLAG_OVERLAPPED here.
+fn openSearchFile(path: []const u8) !std.fs.File {
+    if (builtin.os.tag == .windows) {
+        const windows = std.os.windows;
+        var path_w = try windows.sliceToPrefixedFileW(null, path);
+        // Convert the NT namespace prefix to Win32's extended-length prefix.
+        if (std.mem.startsWith(u16, path_w.span(), &.{ '\\', '?', '?', '\\' })) path_w.data[1] = '\\';
+        const handle = windows.kernel32.CreateFileW(
+            path_w.span().ptr,
+            windows.GENERIC_READ,
+            windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+            null,
+            windows.OPEN_EXISTING,
+            windows.FILE_FLAG_OPEN_REPARSE_POINT,
+            null,
+        );
+        if (handle == windows.INVALID_HANDLE_VALUE) return switch (windows.GetLastError()) {
+            .FILE_NOT_FOUND, .PATH_NOT_FOUND => error.FileNotFound,
+            .ACCESS_DENIED, .SHARING_VIOLATION => error.AccessDenied,
+            else => |err| windows.unexpectedError(err),
+        };
+        return .{ .handle = handle };
+    }
+    return .{ .handle = try std.posix.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOFOLLOW = true }, 0) };
+}
 
 const ProjectionBuilder = struct {
     job: *Job,
@@ -881,4 +909,27 @@ test "disk search prepares only its matched destination and rejects oversized fi
     try std.testing.expectEqual(@as(usize, 5), projection.line_start);
     try std.testing.expectEqual(@as(usize, 11), projection.line_end);
     try std.testing.expectEqual(@as(usize, 6), projection.total_columns);
+}
+
+test "disk search skips symbolic links without following their target" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "target", .data = "needle" });
+    temp.dir.symLink("target", "link", .{}) catch |err| switch (err) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "link" });
+    defer std.testing.allocator.free(path);
+    const files = [_]TestSources.TestFile{.{ .disk = path }};
+    var sources: TestSources = .{ .files = &files };
+    const job = try Job.start(std.testing.allocator, "needle", .{ .file_count = 1, .origin_file = 0, .origin_offset = 0 });
+    defer job.deinit();
+    var result = try sources.finish(job);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.skipped);
+    try std.testing.expect(result.match == null);
+    try std.testing.expect(result.failure == null);
 }
