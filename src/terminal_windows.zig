@@ -72,9 +72,10 @@ pub const Console = struct {
         if (kernel32.GetConsoleMode(self.input, &self.input_mode) == 0 or
             kernel32.GetConsoleMode(self.output, &self.output_mode) == 0) return error.NotATerminal;
 
-        // Read Unicode key records directly. Disable line editing, echo,
-        // Ctrl-C processing and Quick Edit; retain resize notifications.
-        if (kernel32.SetConsoleMode(self.input, 0x0080 | 0x0008) == 0) return error.ConsoleModeFailed;
+        // VT input retains escape sequences (including bracketed paste) in key
+        // records. ReadConsoleInputW still reports resize events in this mode.
+        // Disable line editing, echo, Ctrl-C processing and Quick Edit.
+        if (kernel32.SetConsoleMode(self.input, 0x0200 | 0x0080 | 0x0008) == 0) return error.ConsoleModeFailed;
         errdefer _ = kernel32.SetConsoleMode(self.input, self.input_mode);
         const output_mode = self.output_mode | 0x0001 | windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING | windows.DISABLE_NEWLINE_AUTO_RETURN;
         if (kernel32.SetConsoleMode(self.output, output_mode) == 0) return error.VirtualTerminalUnsupported;
@@ -144,7 +145,10 @@ pub const Console = struct {
     }
 
     fn encodeKey(self: *Console, key: KeyEvent) void {
-        if (key.down == 0) return;
+        // ConPTY and Alt+numpad composition can deliver Unicode (including
+        // surrogate pairs) on VK_MENU release. Other releases repeat the
+        // preceding press and must not insert the character a second time.
+        if (key.down == 0 and (key.virtual_key != 0x12 or key.unicode == 0)) return;
         var scalar: u21 = key.unicode;
         if (scalar >= 0xd800 and scalar <= 0xdbff) {
             self.high_surrogate = key.unicode;
@@ -202,6 +206,37 @@ test "Windows Unicode key records preserve characters, surrogate pairs and repea
     console.encodeKey(key);
     for ("\x1b[D") |byte| try std.testing.expectEqual(byte, console.takeEncoded().?);
     key.down = 0;
+    console.encodeKey(key);
+    try std.testing.expectEqual(null, console.takeEncoded());
+}
+
+test "ConPTY Unicode Alt release records are text but ordinary releases are ignored" {
+    var console: Console = .{
+        .input = undefined,
+        .output = undefined,
+        .input_mode = 0,
+        .output_mode = 0,
+        .output_code_page = 0,
+    };
+    var key: KeyEvent = .{ .down = 0, .repeat = 1, .virtual_key = 0x12, .scan_code = 0, .unicode = 0x00e9, .control = 0 };
+    console.encodeKey(key);
+    for ("é") |byte| try std.testing.expectEqual(byte, console.takeEncoded().?);
+    key.unicode = 0xd83d;
+    console.encodeKey(key);
+    try std.testing.expectEqual(null, console.takeEncoded());
+    key.unicode = 0xde00;
+    console.encodeKey(key);
+    for ("😀") |byte| try std.testing.expectEqual(byte, console.takeEncoded().?);
+    key.virtual_key = 'A';
+    key.unicode = 'a';
+    key.down = 1;
+    console.encodeKey(key);
+    try std.testing.expectEqual(@as(u8, 'a'), console.takeEncoded().?);
+    key.down = 0;
+    console.encodeKey(key);
+    try std.testing.expectEqual(null, console.takeEncoded());
+    key.virtual_key = 0x12;
+    key.unicode = 0;
     console.encodeKey(key);
     try std.testing.expectEqual(null, console.takeEncoded());
 }
