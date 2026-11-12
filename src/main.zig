@@ -5,9 +5,9 @@ const Workspace = @import("content").Workspace;
 const Editor = @import("editor.zig").Editor;
 
 const usage =
-    \\Usage: tome [file]
+    \\Usage: tome [file | directory]
     \\
-    \\Browse the current directory, or start at a given file.
+    \\Browse the current or given directory, or start at a given file.
     \\Files load near the cursor; long workspaces scroll in a loop.
     \\
     \\  i       enter insert mode
@@ -53,24 +53,24 @@ fn run() !void {
     }
     if (args.len > 2) {
         std.debug.print("{s}", .{usage});
-        return error.ExpectedAtMostOneFile;
+        return error.ExpectedAtMostOnePath;
     }
 
-    const cwd = try std.process.getCwdAlloc(allocator);
-    defer allocator.free(cwd);
-    const initial = if (args.len == 2) try std.fs.path.resolve(allocator, &.{ cwd, args[1] }) else null;
-    defer if (initial) |path| allocator.free(path);
-    var root: []const u8 = cwd;
-    var initial_file = initial;
-    if (initial) |path| {
-        const stat = std.fs.cwd().statFile(path) catch |err| switch (err) {
-            error.FileNotFound => null,
+    var file_arg: ?[]const u8 = null;
+    if (args.len == 2) {
+        // Let the OS resolve directory paths, including symlinks before `..`.
+        std.posix.chdirZ(args[1]) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => file_arg = args[1],
             else => return err,
         };
-        if (stat != null and stat.?.kind == .directory) {
-            root = path;
-            initial_file = null;
-        } else if (!std.mem.startsWith(u8, path, cwd) or
+    }
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+    const initial_file = if (file_arg) |path| try std.fs.path.resolve(allocator, &.{ cwd, path }) else null;
+    defer if (initial_file) |path| allocator.free(path);
+    var root: []const u8 = cwd;
+    if (initial_file) |path| {
+        if (!std.mem.startsWith(u8, path, cwd) or
             (cwd.len != 1 and path.len > cwd.len and path[cwd.len] != std.fs.path.sep))
         {
             root = std.fs.path.dirname(path) orelse cwd;

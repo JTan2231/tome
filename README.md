@@ -4,7 +4,7 @@ A small terminal text editor written from scratch in Zig. No package dependencie
 terminal library, curses, or mouse support. It uses Zig's standard library and OS
 interfaces, with escape sequences targeting Ghostty.
 
-## Build and run
+## Install
 
 Use **Zig 0.15.2**. On macOS, Homebrew's `zig@0.15` includes the linker fix needed
 for recent Apple SDKs:
@@ -12,6 +12,19 @@ for recent Apple SDKs:
 ```sh
 brew install zig@0.15
 export PATH="$(brew --prefix zig@0.15)/bin:$PATH"
+```
+
+From the checkout, run `./install.sh` to build and install `tome` in
+`~/.local/bin`. If that directory is missing from your `PATH`, add the following
+line to your shell startup file and open a new terminal.
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+## Build and run
+
+```sh
 zig build
 ./zig-out/bin/tome           # browse the current directory
 ./zig-out/bin/tome notes.txt # start at a particular file
@@ -152,10 +165,12 @@ and existing 64 MiB file limit apply to search too.
   copies; stale results cannot overwrite edits or perform a canceled jump.
   Initial file opening and explicit ordinary navigation retain their synchronous
   loading behavior. Disk bandwidth and the OS file cache are shared with search.
-- The file list is a snapshot taken at startup. Hidden regular files are included;
-  `.git` directories and symlinks are skipped during discovery. Unreadable or
-  oversized neighbors are skipped when browsing. An explicitly requested file reports an
-  open error if it cannot be loaded.
+- The file list is a snapshot taken at startup. Discovery matches `.gitignore`
+  rules from the workspace root and its subdirectories case-sensitively,
+  regardless of Git tracking status. Hidden regular files are eligible.
+  Discovery skips `.git` directories and symlinks. Unreadable or oversized
+  neighbors are skipped when browsing. An explicitly requested file bypasses
+  ignore rules and reports an open error if it cannot be loaded.
 - Files retain their bytes, including whether they have a final newline. Enter
   uses the first newline's LF or CRLF style; new files use LF.
 - UTF-8 movement and deletion operate on Unicode scalars. Common wide characters
@@ -258,16 +273,9 @@ zig build test
 zig build test-benchmark
 zig build test-scroll
 zig build test-search
-python3 tests/pty_smoke.py
 zig fmt --check build.zig src measurement
 ```
 
 The Python scripts use only the standard library. The benchmark suite and its
-tests require Python 3.10 or later; `pty_smoke.py` drives the built editor through
-a pseudo-terminal. Python is not needed to build or run the editor.
-Tests cover editing, visual selections, yank and paste, UTF-8, CRLF, save
-conflicts, directory ordering, file navigation and looping, workspace writes,
-append, file-boundary jumps, undo and redo,
-search ordering, cancellation and cache isolation, asynchronous viewport loading,
-resizing, and terminal restoration. Use
-`zig build -Doptimize=ReleaseSafe` for a release build.
+tests require Python 3.10 or later. Python is not needed to build or run the
+editor. Use `zig build -Doptimize=ReleaseSafe` for a release build.

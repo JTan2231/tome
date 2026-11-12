@@ -1,4 +1,5 @@
 const std = @import("std");
+const IgnoreRules = @import("gitignore.zig").Rules;
 const storage = @import("storage.zig");
 const Loader = @import("loader.zig").Job;
 
@@ -27,7 +28,7 @@ pub const SaveAllResult = struct {
     first_failed: ?usize = null,
 };
 
-/// Discovery records paths, never file contents. Only nearby documents are read.
+/// Discovery catalogs paths without loading documents.
 pub const Workspace = struct {
     allocator: std.mem.Allocator,
     root: []u8,
@@ -52,7 +53,7 @@ pub const Workspace = struct {
         errdefer self.deinit();
         var dir = try std.fs.cwd().openDir(self.root, .{ .iterate = true });
         defer dir.close();
-        try self.discover(dir, "");
+        try self.discover(dir, "", null);
 
         if (initial_path) |path| {
             const cwd = try std.process.getCwdAlloc(allocator);
@@ -102,21 +103,27 @@ pub const Workspace = struct {
 
     const Child = struct { name: []u8, directory: bool };
 
-    fn discover(self: *Workspace, dir: std.fs.Dir, prefix: []const u8) anyerror!void {
+    fn discover(self: *Workspace, dir: std.fs.Dir, prefix: []const u8, inherited: ?*const IgnoreRules) anyerror!void {
         var children: std.ArrayList(Child) = .empty;
         defer {
             for (children.items) |child| self.allocator.free(child.name);
             children.deinit(self.allocator);
         }
+        var has_gitignore = false;
         var iterator = dir.iterate();
         while (try iterator.next()) |entry| {
             // Following directory links can escape the workspace or create cycles.
             if (entry.kind != .file and entry.kind != .directory) continue;
             if (entry.kind == .directory and std.mem.eql(u8, entry.name, ".git")) continue;
+            if (entry.kind == .file and std.mem.eql(u8, entry.name, ".gitignore")) has_gitignore = true;
             const name = try self.allocator.dupe(u8, entry.name);
             errdefer self.allocator.free(name);
             try children.append(self.allocator, .{ .name = name, .directory = entry.kind == .directory });
         }
+        var local = if (has_gitignore) try IgnoreRules.load(self.allocator, dir, prefix, inherited) else null;
+        defer if (local) |*rules| rules.deinit(self.allocator);
+        const rules: ?*const IgnoreRules = if (local) |*rules| rules else inherited;
+
         std.mem.sort(Child, children.items, {}, struct {
             fn lessThan(_: void, a: Child, b: Child) bool {
                 if (a.directory != b.directory) return a.directory;
@@ -126,10 +133,11 @@ pub const Workspace = struct {
         for (children.items) |child| {
             const relative = try std.fs.path.join(self.allocator, &.{ prefix, child.name });
             defer self.allocator.free(relative);
+            if (IgnoreRules.excludes(rules, child.name, relative, child.directory)) continue;
             if (child.directory) {
                 var nested = dir.openDir(child.name, .{ .iterate = true, .no_follow = true }) catch continue;
                 defer nested.close();
-                self.discover(nested, relative) catch |err| switch (err) {
+                self.discover(nested, relative, rules) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => continue,
                 };
@@ -763,6 +771,7 @@ test "empty directory stays empty and explicit symlink reuses its target" {
 test "catalog and resident buffers clean up after allocation failures" {
     var temp = std.testing.tmpDir(.{});
     defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = ".gitignore", .data = ".gitignore\n" });
     try temp.dir.writeFile(.{ .sub_path = "a", .data = "contents" });
     const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root);
@@ -773,4 +782,71 @@ test "catalog and resident buffers clean up after allocation failures" {
             _ = try workspace.ensure(0);
         }
     }.exercise, .{root});
+}
+
+test "catalog applies root and nested gitignore rules in browsing order" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.makePath("ignored");
+    try temp.dir.makePath("nested/deep");
+    try temp.dir.writeFile(.{
+        .sub_path = ".gitignore",
+        .data = "\xef\xbb\xbf*.tmp\r\n!keep.tmp\r\nignored/\n!ignored/keep.txt\n/root.txt  \nfolder-only/\n\\#scratch\\ \n",
+    });
+    try temp.dir.writeFile(.{
+        .sub_path = "nested/.gitignore",
+        .data = "/local.txt\nkeep.tmp\n!child.tmp\n",
+    });
+    for ([_][]const u8{
+        "#scratch ",
+        ".hidden",
+        "discard.tmp",
+        "keep.tmp",
+        "root.txt",
+        "ignored/keep.txt",
+        "nested/child.tmp",
+        "nested/folder-only",
+        "nested/keep.tmp",
+        "nested/local.txt",
+        "nested/root.txt",
+        "nested/deep/local.txt",
+    }) |name| try temp.dir.writeFile(.{ .sub_path = name, .data = "contents" });
+
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    const expected = [_][]const u8{
+        "nested/deep/local.txt",
+        "nested/.gitignore",
+        "nested/child.tmp",
+        "nested/folder-only",
+        "nested/root.txt",
+        ".gitignore",
+        ".hidden",
+        "keep.tmp",
+    };
+    try std.testing.expectEqual(expected.len, workspace.entries.items.len);
+    for (workspace.entries.items, expected) |entry, name| {
+        try std.testing.expectEqualStrings(name, entry.name);
+    }
+}
+
+test "explicitly opening a gitignored file adds only that ignored file to the catalog" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.makePath("ignored");
+    try temp.dir.writeFile(.{ .sub_path = ".gitignore", .data = "ignored/\n" });
+    try temp.dir.writeFile(.{ .sub_path = "ignored/open.txt", .data = "explicit contents" });
+    try temp.dir.writeFile(.{ .sub_path = "ignored/other.txt", .data = "other contents" });
+
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const initial = try std.fs.path.join(std.testing.allocator, &.{ root, "ignored/open.txt" });
+    defer std.testing.allocator.free(initial);
+    var workspace = try Workspace.open(std.testing.allocator, root, initial);
+    defer workspace.deinit();
+    try std.testing.expectEqual(@as(usize, 2), workspace.entries.items.len);
+    try std.testing.expectEqualStrings("ignored/open.txt", workspace.entries.items[workspace.initial_index].name);
+    try std.testing.expectEqualStrings("explicit contents", (try workspace.ensure(workspace.initial_index)).buffer.bytes.items);
 }

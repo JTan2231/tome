@@ -18,11 +18,13 @@ pub fn build(b: *std.Build) void {
         .name = "tome",
         .root_module = app,
     });
-    b.installArtifact(exe);
+    const install_tome = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_tome.step);
+    b.step("install-tome", "Install the tome executable").dependOn(&install_tome.step);
 
     const run = b.addRunArtifact(exe);
     if (b.args) |args| run.addArgs(args);
-    b.step("run", "Run tome (optionally pass a starting file after --)").dependOn(&run.step);
+    b.step("run", "Run tome (optionally pass a file or directory after --)").dependOn(&run.step);
 
     const measurement = b.addModule("measurement", .{
         .root_source_file = b.path("measurement/file_ready.zig"),
