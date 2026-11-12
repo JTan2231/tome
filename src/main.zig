@@ -11,8 +11,11 @@ const usage =
     \\Files load near the cursor; long workspaces scroll in a loop.
     \\
     \\  i       enter insert mode
+    \\  a       append after the current character (within the line)
     \\  Escape  return to normal mode
     \\  hjkl    move in normal/visual mode (arrows work in any mode)
+    \\  gg / G  first / last line; at that border, previous / next file
+    \\  u / r   undo / redo the current file in normal mode
     \\  v / V   select characters / whole lines (Shift+V)
     \\  o       swap ends of a visual selection
     \\  y       yank selection; yy or Y yanks a line in normal mode
@@ -20,7 +23,7 @@ const usage =
     \\  d / c   delete / change selection; dd / cc operate on a line
     \\  x       delete a character or selection
     \\  D / C   delete / change through end of line
-    \\  y/d/c + hjkl, 0, $, arrows, Home, End operate on a motion
+    \\  y/d/c + hjkl, 0, $, gg, G, arrows, Home, End operate on a motion
     \\  /text   search forward (literal, case-sensitive; Enter starts)
     \\  n       next match; Escape cancels a pending search
     \\  :w      write all changed files

@@ -49,12 +49,15 @@ insert or command entry. The status bar shows the current mode and file.
 | Key | Action |
 | --- | --- |
 | `i` | Enter insert state from normal |
+| `a` | Enter insert after the current character, staying on the same line |
 | `Escape` | Return to normal, cancel a selection, pending operator, or command entry |
 | `h` `j` `k` `l` | Left, down, up, right in normal or visual |
 | Arrow keys | Move in any mode |
 | Page Up / Page Down | Scroll by a display of content |
 | `0` / `$` | Start / end of line in normal or visual |
 | Home / End | Start / end of line in any mode |
+| `gg` / `G` | First / last line of the file; repeat at that boundary to reach the previous / next file |
+| `u` / `r` | Undo / redo in normal mode |
 | `v` / `V` (`Shift+V`) | Select characters / whole lines; move to extend the selection |
 | `o` | Move to the other end of a visual selection |
 | `y` / `Y` in visual | Yank the selection / all touched lines |
@@ -74,11 +77,24 @@ insert or command entry. The status bar shows the current mode and file.
 
 Visual selections include the character under the cursor. Press the same visual
 key again to cancel, or the other one to switch between characters and lines.
-The supported operator motions are `h`, `j`, `k`, `l`, `0`, `$`, arrows, Home,
-and End; vertical motions operate on whole lines. For example, `y$` yanks to
+The supported operator motions are `h`, `j`, `k`, `l`, `0`, `$`, `gg`, `G`, arrows,
+Home, and End; vertical motions operate on whole lines. For example, `y$` yanks to
 the end of the line and `dj` deletes the current and next lines. Visual selections
 and operator motions stay within the current file. Yanked text can be pasted into
 another file after navigating there.
+
+`gg` and `G` land on the first nonblank character of the first or last line.
+In normal mode, using either while already on its boundary line jumps to the
+same boundary of the neighboring file, following the usual browsing order and
+looping rules. In visual mode and operator motions, these jumps stay in the
+current file.
+
+Undo history belongs to each file and lasts for the editor session, including
+after saving or browsing other files. An insert session is one undo step; moving
+the cursor starts a new step for subsequent typing. A bracketed paste is its own
+step. Deleting or pasting in normal or visual mode is one step per action.
+A new edit after undo discards redo history.
+Undoing or redoing to the saved version clears the unsaved marker.
 
 Yanks and deletions share one register, kept in memory for this editor session.
 It is separate from the system clipboard. Visual replacement keeps that register
@@ -95,7 +111,7 @@ Type a command and press Enter:
 | `:q!` or `:quit!` | Quit and discard unsaved edits |
 
 Write and quit are the only commands. Command entry is a prompt within normal
-mode. Numeric counts, word motions, block selections, named registers, undo,
+mode. Numeric counts, word motions, block selections, named registers,
 regular-expression search, and configuration are not implemented. The cursor denotes an insertion
 position, including after the last character of a line; horizontal movement can
 cross line boundaries. This differs from Vim's normal-mode cursor semantics.
@@ -123,8 +139,9 @@ and existing 64 MiB file limit apply to search too.
   load as they approach the viewport. Clean buffers use a cache limited to eight
   files or 8 MiB, with the active, currently requested, and visible files protected.
   A viewport spanning many or large files can exceed this budget. Unsaved
-  buffers stay in memory until saved or discarded, so their size can exceed this
-  cache budget.
+  buffers and files with undo history stay in memory for the session, so their
+  size can exceed this cache budget. Undo keeps a full buffer snapshot per step;
+  its memory use grows with file size and edit count.
 - Interactive frames request missing content asynchronously and can show blank
   filler rows until it is ready. Search scans use separate, bounded 64 KiB chunks
   and do not admit files, change cache recency, or evict editor buffers. Only the
@@ -250,6 +267,7 @@ tests require Python 3.10 or later; `pty_smoke.py` drives the built editor throu
 a pseudo-terminal. Python is not needed to build or run the editor.
 Tests cover editing, visual selections, yank and paste, UTF-8, CRLF, save
 conflicts, directory ordering, file navigation and looping, workspace writes,
+append, file-boundary jumps, undo and redo,
 search ordering, cancellation and cache isolation, asynchronous viewport loading,
 resizing, and terminal restoration. Use
 `zig build -Doptimize=ReleaseSafe` for a release build.

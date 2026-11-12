@@ -176,6 +176,50 @@ def normal_motion_and_delete(directory):
         editor.quit()
 
 
+def append_unicode_and_line_end(directory):
+    path = directory / "append.txt"
+    path.write_bytes("éx\r\nnext".encode())
+    with Editor(cwd=directory) as editor:
+        editor.send(b"a", b"INSERT")
+        editor.send(b"!")
+        editor.send(b"\x1b", b"NORMAL")
+        editor.write()
+        assert path.read_bytes() == "é!x\r\nnext".encode()
+        # Appending at the insertion position after a line must not cross CRLF.
+        editor.send(b"$a", b"INSERT")
+        editor.send(b"END")
+        editor.send(b"\x1b", b"NORMAL")
+        editor.write()
+        assert path.read_bytes() == "é!xEND\r\nnext".encode()
+        editor.quit()
+
+
+def undo_redo_groups_and_saved_version(directory):
+    path = directory / "history.txt"
+    original = b"one\r\ntwo"
+    path.write_bytes(original)
+    with Editor(cwd=directory) as editor:
+        editor.insert(b"alpha\r")
+        frame = editor.frame_after(b"u")
+        assert b"NORMAL  " in frame and b"NORMAL [+]" not in frame, frame
+        assert b"alpha" not in frame, "undo did not remove the entire insert session"
+        frame = editor.frame_after(b"r")
+        assert b"NORMAL [+]" in frame and b"alpha" in frame, frame
+        editor.write()
+        assert path.read_bytes() == b"alpha\r\n" + original
+        frame = editor.frame_after(b"u")
+        assert b"NORMAL [+]" in frame, "undo past the saved version was marked clean"
+        frame = editor.frame_after(b"r")
+        assert b"NORMAL  " in frame and b"NORMAL [+]" not in frame, frame
+        editor.send(b"u")
+        editor.insert(b"NEW")
+        # A new edit replaces the old redo branch; r must leave it intact.
+        editor.send(b"r")
+        editor.write()
+        assert path.read_bytes() == b"NEW" + original
+        editor.quit()
+
+
 def literal_paste_and_discard(directory):
     path = directory / "paste.txt"
     original = b"original"
@@ -352,6 +396,38 @@ def filename_start_and_workspace_writes(directory):
         assert editor.process.poll() is None
         editor.write()
         assert second.read_bytes() == b"Bbravo"
+        editor.quit()
+
+
+def file_jumps_and_independent_undo(directory):
+    first = directory / "a.txt"
+    second = directory / "b.txt"
+    first.write_bytes(b"  a-first\na-last")
+    second.write_bytes(b"b-first\n  b-last")
+    with Editor(cwd=directory) as editor:
+        frame = editor.frame_after(b"G")
+        assert_current(frame, "a.txt")
+        assert b"NORMAL  2:1  " in frame, frame
+        frame = editor.frame_after(b"G")
+        assert_current(frame, "b.txt")
+        assert b"NORMAL  2:3  " in frame, frame
+        editor.insert(b"B")
+        frame = editor.frame_after(b"gg")
+        assert_current(frame, "b.txt")
+        assert b"NORMAL [+]  1:1  " in frame, frame
+        frame = editor.frame_after(b"gg")
+        assert_current(frame, "a.txt")
+        assert b"NORMAL  1:3  " in frame, frame
+        editor.insert(b"A")
+        editor.frame_after(b"u")
+        editor.write()
+        assert first.read_bytes() == b"  a-first\na-last"
+        assert second.read_bytes() == b"b-first\n  Bb-last"
+        frame = editor.frame_after(b"GG")
+        assert_current(frame, "b.txt")
+        editor.send(b"u")
+        editor.write()
+        assert second.read_bytes() == b"b-first\n  b-last"
         editor.quit()
 
 
@@ -585,7 +661,9 @@ def main():
     if not BINARY.is_file():
         raise SystemExit(f"Build the editor first with `zig build`: missing {BINARY}")
     cases = [new_file_and_unsaved_guard, utf8_backspace_and_arrows,
-             preserve_crlf, normal_motion_and_delete, literal_paste_and_discard,
+             preserve_crlf, normal_motion_and_delete,
+             append_unicode_and_line_end, undo_redo_groups_and_saved_version,
+             literal_paste_and_discard,
              visual_character_yank_and_paste, visual_line_yank_does_not_modify,
              line_yank_and_paste_without_final_newline, line_yank_and_paste_crlf,
              visual_delete_and_change, visual_replace_keeps_register,
@@ -593,6 +671,7 @@ def main():
              failed_save_keeps_original_and_buffer,
              directory_browse_order_and_margin,
              filename_start_and_workspace_writes,
+             file_jumps_and_independent_undo,
              single_short_file_does_not_repeat,
              long_file_wraps_both_directions,
              long_workspace_wraps_between_files,

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Buffer = @import("buffer.zig").Buffer;
+const History = @import("history.zig").History;
 
 /// A simple in-memory editor deliberately limits the amount read at once.
 pub const max_file_size = 64 * 1024 * 1024;
@@ -8,6 +9,7 @@ pub const Document = struct {
     allocator: std.mem.Allocator,
     path: []u8,
     buffer: Buffer,
+    history: History = .{},
     is_new: bool,
     saved_stat: ?std.fs.File.Stat,
 
@@ -62,6 +64,7 @@ pub const Document = struct {
     }
 
     pub fn deinit(self: *Document) void {
+        self.history.deinit(self.allocator);
         self.buffer.deinit(self.allocator);
         self.allocator.free(self.path);
         self.* = undefined;
@@ -90,6 +93,7 @@ pub const Document = struct {
         try atomic.finish();
         self.saved_stat = try statOrMissing(self.path);
         self.is_new = false;
+        self.history.markSaved();
     }
 
     fn checkUnchanged(self: *const Document) !void {

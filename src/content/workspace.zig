@@ -299,7 +299,7 @@ pub const Workspace = struct {
         }
     }
 
-    /// Dirty buffers and the active/requested documents are never evicted.
+    /// Dirty buffers, undo histories, and active/requested documents are retained.
     /// A single large active file can therefore exceed the clean-cache budget.
     fn trim(self: *Workspace, requested: usize) void {
         while (true) {
@@ -309,7 +309,7 @@ pub const Workspace = struct {
             for (self.resident.items) |index| {
                 const entry = self.entries.items[index];
                 const document = entry.document.?;
-                if (entry.dirty or document.is_new) continue;
+                if (entry.dirty or document.is_new or document.history.items.items.len != 0) continue;
                 count += 1;
                 bytes += document.buffer.bytes.capacity;
                 if (index == requested or self.active_index == index or
@@ -621,6 +621,36 @@ test "clean cache is bounded and dirty documents survive eviction" {
     // Reloading an evicted file must not accumulate stale resident entries.
     _ = try workspace.ensure(2);
     try std.testing.expect(workspace.resident.items.len <= cache_file_limit);
+}
+
+test "saved documents retain undo history under cache pressure" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    for (0..20) |index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "file{d:0>2}", .{index});
+        try temp.dir.writeFile(.{ .sub_path = name, .data = "content" });
+    }
+    const root = try temp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    var workspace = try Workspace.open(allocator, root, null);
+    defer workspace.deinit();
+    const first = try workspace.ensure(0);
+    try first.history.beginChange(allocator, &first.buffer);
+    try first.buffer.insert(allocator, "edited ");
+    workspace.markDirty(0);
+    try workspace.save(0);
+    try std.testing.expect(!first.history.isDirty());
+    for (1..20) |index| _ = try workspace.ensure(index);
+    try std.testing.expectEqual(first, workspace.entries.items[0].document.?);
+    try std.testing.expect(workspace.entries.items[1].document == null);
+    try std.testing.expect(first.history.undo(&first.buffer));
+    try std.testing.expectEqualStrings("content", first.buffer.bytes.items);
+    try std.testing.expect(first.history.isDirty());
+    try std.testing.expect(first.history.redo(&first.buffer));
+    try std.testing.expectEqualStrings("edited content", first.buffer.bytes.items);
+    try std.testing.expect(!first.history.isDirty());
 }
 
 test "save all preserves failed edits and still writes other changed files" {
