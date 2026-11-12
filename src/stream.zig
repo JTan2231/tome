@@ -6,6 +6,7 @@ const Document = @import("content").Document;
 pub const Row = struct {
     file: usize,
     start: usize = 0,
+    number: usize = 1, // One-based within the file; unused for separators.
     gap: bool = false,
     // A line end found while rendering, reused for the next forward step.
     // Rows are local to one traversal; never retain this across buffer edits.
@@ -90,18 +91,18 @@ pub const Stream = struct {
                 return .{ .file = next };
             }
             const document = try self.load(row.file) orelse return null;
-            return .{ .file = row.file, .start = document.buffer.lineStart(document.buffer.bytes.items.len) };
+            return .{ .file = row.file, .start = document.buffer.lineStart(document.buffer.bytes.items.len), .number = document.buffer.line_count };
         }
         const document = try self.load(row.file) orelse return null;
         const buffer = &document.buffer;
         const start = buffer.lineStart(@min(row.start, buffer.bytes.items.len));
         if (forward) {
             const end = row.end orelse buffer.lineEnd(start);
-            if (end < buffer.bytes.items.len) return .{ .file = row.file, .start = buffer.nextIndex(end) };
+            if (end < buffer.bytes.items.len) return .{ .file = row.file, .start = buffer.nextIndex(end), .number = row.number + 1 };
             if (try self.adjacent(row.file, true, wrap) == null) return null;
             return .{ .file = row.file, .gap = true };
         }
-        if (start != 0) return .{ .file = row.file, .start = buffer.lineStart(buffer.previousIndex(start)) };
+        if (start != 0) return .{ .file = row.file, .start = buffer.lineStart(buffer.previousIndex(start)), .number = row.number - 1 };
         const previous = try self.adjacent(row.file, false, wrap) orelse return null;
         return .{ .file = previous, .gap = true };
     }
@@ -119,7 +120,7 @@ test "file traversal preserves CRLF lines and separates files in both directions
     var stream = Stream.init(&workspace);
     const rows = [_]Row{
         .{ .file = 0 },
-        .{ .file = 0, .start = 5 },
+        .{ .file = 0, .start = 5, .number = 2 },
         .{ .file = 0, .gap = true },
         .{ .file = 1 },
     };
@@ -147,7 +148,7 @@ test "short workspaces stay finite and long content wraps after a separator" {
     workspace.markDirty(0);
     try std.testing.expect(try stream.canWrap(2));
     try std.testing.expect(!try stream.canWrap(3));
-    const last = Row{ .file = 0, .start = 4 };
+    const last = Row{ .file = 0, .start = 4, .number = 3 };
     const gap = Row{ .file = 0, .gap = true };
     try std.testing.expectEqualDeep(gap, (try stream.step(last, true, true)).?);
     try std.testing.expectEqualDeep(Row{ .file = 0 }, (try stream.step(gap, true, true)).?);

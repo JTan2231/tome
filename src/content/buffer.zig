@@ -1,6 +1,9 @@
 const std = @import("std");
+const indentation = @import("indentation.zig");
 
 pub const Buffer = struct {
+    pub const max_indent_width = indentation.max_width;
+
     bytes: std.ArrayList(u8),
     cursor: usize = 0,
     // Number of LF bytes before cursor; maintained together with cursor.
@@ -9,6 +12,9 @@ pub const Buffer = struct {
     line_count: usize = 1,
     preferred_column: ?usize = null,
     newline: []const u8,
+    indent_style: indentation.Style,
+    // The copied prefix of a new blank line. History snapshots can hold it too.
+    auto_indent: ?struct { start: usize, end: usize } = null,
 
     pub fn init(bytes: std.ArrayList(u8)) Buffer {
         const first_lf = std.mem.indexOfScalar(u8, bytes.items, '\n') orelse 0;
@@ -16,6 +22,7 @@ pub const Buffer = struct {
         return .{
             .bytes = bytes,
             .newline = if (crlf) "\r\n" else "\n",
+            .indent_style = indentation.detect(bytes.items),
             .line_count = 1 + std.mem.count(u8, bytes.items, "\n"),
         };
     }
@@ -69,6 +76,33 @@ pub const Buffer = struct {
     pub fn previousIndex(self: *const Buffer, index: usize) usize {
         std.debug.assert(index <= self.bytes.items.len);
         return if (index == 0) 0 else self.unitStart(index - 1);
+    }
+
+    pub fn previousWordStart(bytes: []const u8, end: usize) usize {
+        std.debug.assert(end <= bytes.len);
+        var index = end;
+        while (index > 0 and std.ascii.isWhitespace(bytes[index - 1])) : (index -= 1) {}
+        if (index == 0) return 0;
+        const class = wordClass(bytes[index - 1]);
+        while (index > 0 and wordClass(bytes[index - 1]) == class) : (index -= 1) {}
+        return index;
+    }
+
+    pub fn nextWordStart(bytes: []const u8, start: usize) usize {
+        std.debug.assert(start <= bytes.len);
+        if (start == bytes.len) return start;
+        var index = start;
+        const class = wordClass(bytes[index]);
+        while (index < bytes.len and wordClass(bytes[index]) == class) : (index += 1) {}
+        while (index < bytes.len and std.ascii.isWhitespace(bytes[index])) : (index += 1) {}
+        return index;
+    }
+
+    fn wordClass(byte: u8) enum { whitespace, word, punctuation } {
+        if (std.ascii.isWhitespace(byte)) return .whitespace;
+        // Treat every byte of a UTF-8 scalar as part of the same word.
+        if (byte >= 0x80 or std.ascii.isAlphanumeric(byte) or byte == '_') return .word;
+        return .punctuation;
     }
 
     pub fn setCursor(self: *Buffer, index: usize) void {
@@ -154,6 +188,14 @@ pub const Buffer = struct {
 
     pub fn insertNewline(self: *Buffer, allocator: std.mem.Allocator) !void {
         try self.insert(allocator, self.newline);
+    }
+
+    pub fn discardAutoIndent(self: *Buffer) void {
+        const indent = self.auto_indent orelse return;
+        const len = indent.end - indent.start;
+        self.bytes.replaceRangeAssumeCapacity(indent.start, len, "");
+        self.cursor -= @min(self.cursor -| indent.start, len);
+        self.auto_indent = null;
     }
 
     pub fn moveHome(self: *Buffer) void {

@@ -46,8 +46,9 @@ quoted. `tome --help` prints a quick reference.
 
 Move past a file's first or last line to enter its neighbor. Each directory visits
 its subdirectories first, then its files, with names sorted alphabetically in
-each group (case-sensitive byte order). A blank row separates file contents, and
-the bottom status margin shows the file under the cursor. The sequence loops in
+each group (case-sensitive byte order). A blank row separates file contents. Line
+numbers appear in the left gutter and start at 1 for each file. The bottom
+status margin shows the file under the cursor. The sequence loops in
 either direction when its
 combined content has more lines than the display area. Short workspaces stop at
 their ends, so a lone one-line file does not repeat. Empty directories open an
@@ -66,7 +67,8 @@ insert or command entry. The status bar shows the current mode and file.
 | `Escape` | Return to normal, cancel a selection, pending operator, or command entry |
 | `h` `j` `k` `l` | Left, down, up, right in normal or visual |
 | Arrow keys | Move in any mode |
-| Page Up / Page Down | Scroll by a display of content |
+| Ctrl+Left / Ctrl+Right | Move by words |
+| Page Up / Page Down or Shift+Up / Shift+Down | Scroll by a display of content |
 | `0` / `$` | Start / end of line in normal or visual |
 | Home / End | Start / end of line in any mode |
 | `gg` / `G` | First / last line of the file; repeat at that boundary to reach the previous / next file |
@@ -82,19 +84,22 @@ insert or command entry. The status bar shows the current mode and file.
 | `x` in normal | Delete the character at the cursor |
 | `D` / `C` in normal | Delete / change through the end of the line |
 | `y`, `d`, or `c`, then a motion | Yank, delete, or change the range in normal mode |
-| Text / Enter / Tab | Insert text / newline / literal tab in insert |
+| Text / Enter / Tab | Insert text / newline with copied indentation / indent using the file's style |
 | Backspace / Delete | Delete before / at the cursor in insert |
+| Ctrl+W | Delete the previous word in insert mode, command entry, or search |
 | `:` | Enter an editor command from normal |
 | `/` | Enter a forward literal search in normal or visual mode; Enter starts it |
 | `n` | Find the next occurrence of the last search from the cursor |
+| `Space f` | Open the file picker and filter by path |
+| `Space g` | Open the search picker and list matches across the workspace |
 
 Visual selections include the character under the cursor. Press the same visual
 key again to cancel, or the other one to switch between characters and lines.
 The supported operator motions are `h`, `j`, `k`, `l`, `0`, `$`, `gg`, `G`, arrows,
-Home, and End; vertical motions operate on whole lines. For example, `y$` yanks to
-the end of the line and `dj` deletes the current and next lines. Visual selections
-and operator motions stay within the current file. Yanked text can be pasted into
-another file after navigating there.
+Ctrl+Left/Right, Home, and End. Vertical motions operate on whole lines. For
+example, `y$` yanks to the end of the line and `dj` deletes the current and next
+lines. Visual selections and operator motions stay within the current file.
+Yanked text can be pasted into another file after navigating there.
 
 `gg` and `G` land on the first nonblank character of the first or last line.
 In normal mode, using either while already on its boundary line jumps to the
@@ -124,8 +129,8 @@ Type a command and press Enter:
 | `:q!` or `:quit!` | Quit and discard unsaved edits |
 
 Write and quit are the only commands. Command entry is a prompt within normal
-mode. Numeric counts, word motions, block selections, named registers,
-regular-expression search, and configuration are not implemented. The cursor denotes an insertion
+mode. Numeric counts, block selections, named registers, regular-expression
+search, and configuration are not implemented. The cursor denotes an insertion
 position, including after the last character of a line; horizontal movement can
 cross line boundaries. This differs from Vim's normal-mode cursor semantics.
 
@@ -145,15 +150,26 @@ pass with no match reports `Pattern not found`; skipped unreadable, changing, or
 oversized files are reported as incomplete coverage. The startup file catalog
 and existing 64 MiB file limit apply to search too.
 
+In normal mode, `Space` waits for one key. `f` lists browsable workspace paths;
+type to filter by substring, ignoring ASCII case. `g` starts with an empty list;
+type a literal, case-sensitive query to search the workspace, including unsaved
+edits. Matches appear as `path:line:column` and append as the search runs without
+moving the selection. Changing the query starts a fresh list.
+
+In either picker, use Up/Down, Page Up/Page Down (or Shift+Up/Down), or Home/End
+to move the selection. Ctrl+P/N moves one row and Ctrl+U/D moves half a page.
+Enter jumps to the selected file's start or the selected match. Escape returns
+to the editor at the original position.
+
 ## Behavior and limits
 
 - Zig (`.zig`, `.zon`) and C (`.c`, `.h`) get syntax colors from built-in
   scanners. Highlighting reads the current buffer, including unsaved edits,
-  and runs in the background. The editor draws plain text while colors for the
-  current revision are pending. Highlighting is limited to buffers up to 1 MiB
-  and 65,536 colored ranges per file. No language tools are needed at runtime.
-  The default palette is compiled from `src/syntax_theme.json` using the ANSI
-  color subset of Tree-sitter's theme format.
+  and runs in the background. Existing colors stay visible through edits while
+  the scanner checks for changed ranges. Highlighting is limited to buffers up
+  to 1 MiB and 65,536 colored ranges per file. No language tools are needed at
+  runtime. The default palette is compiled from `src/syntax_theme.json` using
+  the ANSI color subset of Tree-sitter's theme format.
 - Vertical and horizontal scrolling follow the cursor; lines do not wrap.
 - Discovery records file paths, without reading every file into a buffer. Contents
   load as they approach the viewport. Clean buffers and their syntax ranges use
@@ -180,7 +196,11 @@ and existing 64 MiB file limit apply to search too.
   neighbors are skipped when browsing. An explicitly requested file bypasses
   ignore rules and reports an open error if it cannot be loaded.
 - Files retain their bytes, including whether they have a final newline. Enter
-  uses the first newline's LF or CRLF style; new files use LF.
+  uses the first newline's LF or CRLF style and copies the current line's
+  leading whitespace. Copied indentation on an untouched blank line is removed
+  when you leave the line or press Escape. New files use LF.
+- Tab defaults to four-space stops. On open, Tome samples leading whitespace to
+  detect whether the file uses literal tabs or a different number of spaces.
 - UTF-8 movement and deletion operate on Unicode scalars. Common wide characters
   and combining marks have display widths, but this is not full grapheme-aware
   editing. Joined emoji and some scripts can have imperfect cursor placement.

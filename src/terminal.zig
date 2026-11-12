@@ -32,6 +32,8 @@ pub const Key = union(enum) {
     down,
     left,
     right,
+    ctrl_left,
+    ctrl_right,
     home,
     end,
     delete,
@@ -235,11 +237,13 @@ fn decodeSequence(sequence: []const u8) Key {
     for (params) |byte| {
         if (!(byte >= '0' and byte <= '9') and byte != ';') return .unknown;
     }
+    const shift = prefix == '[' and std.mem.eql(u8, params, "1;2");
+    const ctrl = prefix == '[' and std.mem.eql(u8, params, "1;5");
     return switch (sequence[sequence.len - 1]) {
-        'A' => .up,
-        'B' => .down,
-        'C' => .right,
-        'D' => .left,
+        'A' => if (shift) .page_up else .up,
+        'B' => if (shift) .page_down else .down,
+        'C' => if (ctrl) .ctrl_right else .right,
+        'D' => if (ctrl) .ctrl_left else .left,
         'H' => .home,
         'F' => .end,
         '~' => blk: {
@@ -263,11 +267,15 @@ test "Ghostty cursor, editing, and bracketed paste sequences" {
     try expectEqual(Key.down, decodeSequence("OB"));
     try expectEqual(Key.right, decodeSequence("[1;2C"));
     try expectEqual(Key.left, decodeSequence("[D"));
+    try expectEqual(Key.ctrl_left, decodeSequence("[1;5D"));
+    try expectEqual(Key.ctrl_right, decodeSequence("[1;5C"));
     try expectEqual(Key.home, decodeSequence("[H"));
     try expectEqual(Key.end, decodeSequence("OF"));
     try expectEqual(Key.delete, decodeSequence("[3~"));
     try expectEqual(Key.page_up, decodeSequence("[5~"));
     try expectEqual(Key.page_down, decodeSequence("[6~"));
+    try expectEqual(Key.page_up, decodeSequence("[1;2A"));
+    try expectEqual(Key.page_down, decodeSequence("[1;2B"));
     try expectEqual(Key.paste_start, decodeSequence("[200~"));
     try expectEqual(Key.paste_end, decodeSequence("[201~"));
     try expectEqual(Key.unknown, decodeSequence("[<0;12;4M"));

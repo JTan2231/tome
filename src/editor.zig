@@ -6,6 +6,8 @@ const Workspace = content.Workspace;
 const Stream = @import("stream.zig").Stream;
 const Row = @import("stream.zig").Row;
 const search = content.search;
+const workspace_search = content.workspace_search;
+const Picker = @import("picker.zig").Picker;
 const highlight = content.highlight;
 const syntax_theme = @import("syntax_theme.zig");
 
@@ -29,6 +31,7 @@ pub const Editor = struct {
     anchor: usize = 0,
     pending_operator: ?Operator = null,
     pending_g: bool = false,
+    pending_space: bool = false,
     register: std.ArrayList(u8) = .empty,
     register_linewise: bool = false,
     register_valid: bool = false,
@@ -41,6 +44,9 @@ pub const Editor = struct {
     search_job: ?*search.Job = null,
     search_next: ?search.Options = null,
     search_accept: bool = false,
+    picker: ?Picker = null,
+    picker_job: ?*workspace_search.Job = null,
+    picker_search_pending: bool = false,
     document_revision: u64 = 0,
     highlight_enabled: bool = false,
     highlight_job: ?*highlight.Job = null,
@@ -56,6 +62,7 @@ pub const Editor = struct {
     accept_paste: bool = false,
     paste_cr: bool = false,
     paste_origin_row: ?usize = null,
+    paste_revision: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, document: *content.Document, filename: []const u8) Editor {
         return .{ .allocator = allocator, .document = document, .filename = filename };
@@ -96,6 +103,8 @@ pub const Editor = struct {
     pub fn deinit(self: *Editor) void {
         if (self.highlight_job) |job| job.deinit();
         if (self.search_job) |job| job.deinit();
+        if (self.picker_job) |job| job.deinit();
+        if (self.picker) |*picker| picker.deinit(self.allocator);
         self.clearProjection();
         self.search_text.deinit(self.allocator);
         self.last_search.deinit(self.allocator);
@@ -116,7 +125,7 @@ pub const Editor = struct {
         while (true) {
             const timeout_ms: i32 = if (self.search_job != null or self.search_next != null)
                 1
-            else if (self.highlight_job != null or (self.workspace != null and self.workspace.?.hasPendingRequest()))
+            else if (self.picker_job != null or self.highlight_job != null or (self.workspace != null and self.workspace.?.hasPendingRequest()))
                 8
             else
                 100;
@@ -127,7 +136,8 @@ pub const Editor = struct {
             const next_size = tty.size();
             const resized = next_size.rows != size.rows or next_size.cols != size.cols;
             size = next_size;
-            if (!self.pasting and (key != .tick or resized or self.background_redraw)) {
+            const picker_pasting = if (self.picker) |picker| picker.paste_start != null else false;
+            if (!self.pasting and !picker_pasting and (key != .tick or resized or self.background_redraw)) {
                 self.background_redraw = false;
                 try self.draw(tty, size);
             }
@@ -139,10 +149,14 @@ pub const Editor = struct {
             try self.pollBackground();
             return false;
         }
+        if (self.picker != null) {
+            try self.pickerKey(key);
+            return false;
+        }
         // Repeated n coalesces while a request is running. Every other input
         // supersedes its automatic jump before completed work is delivered.
         const repeat_search = !self.command_active and !self.search_prompt and
-            self.mode != .insert and self.pending_operator == null and !self.pending_g and
+            self.mode != .insert and self.pending_operator == null and !self.pending_g and !self.pending_space and
             key == .byte and key.byte == 'n';
         if (!repeat_search) self.cancelSearch();
         // A bracketed paste is one movement for viewport purposes. Avoid
@@ -168,14 +182,27 @@ pub const Editor = struct {
         if (key == .paste_start) {
             self.pending_operator = null;
             self.pending_g = false;
+            self.pending_space = false;
             self.pasting = true;
             self.accept_paste = self.mode == .insert and !self.command_active;
             self.paste_cr = false;
-            if (self.accept_paste) self.document.history.endChange();
+            if (self.accept_paste) {
+                self.document.history.endChange();
+                self.paste_revision = self.currentRevision();
+            }
             return false;
         }
         if (key == .paste_end) {
-            if (self.accept_paste) self.document.history.endChange();
+            if (self.accept_paste) {
+                const history = &self.document.history;
+                if (history.grouping) {
+                    // Remap once for the entire paste using its undo snapshot.
+                    const before = history.items.items[history.position - 1].bytes.items;
+                    const after = self.document.buffer.bytes.items;
+                    self.document.highlights.rebase(self.paste_revision, self.currentRevision(), highlight.Edit.between(before, after), after.len);
+                }
+                history.endChange();
+            }
             self.pasting = false;
             self.accept_paste = false;
             return false;
@@ -191,6 +218,21 @@ pub const Editor = struct {
         if (self.search_prompt) return self.searchKey(key);
         if (self.command_active) return self.commandKey(key);
         if (key == .tick) return false;
+        if (self.pending_space) {
+            self.pending_space = false;
+            if (key == .byte and self.workspace != null) switch (key.byte) {
+                'f' => try self.openPicker(.files),
+                'g' => try self.openPicker(.search),
+                else => {},
+            };
+            return false;
+        }
+        if (self.mode == .normal and key == .byte and key.byte == ' ') {
+            self.pending_operator = null;
+            self.pending_g = false;
+            self.pending_space = true;
+            return false;
+        }
         if (self.workspace != null and self.current_file == null) {
             if (key == .byte and key.byte == ':') {
                 self.command_active = true;
@@ -201,8 +243,9 @@ pub const Editor = struct {
         // Insert text is one undo step until movement, Escape, or a paste.
         // Normal-mode edits each start a fresh step; change operators keep
         // their deletion and following inserted text in the same step.
+        if (key == .escape) self.discardAutoIndent();
         if (self.mode != .insert or switch (key) {
-            .escape, .up, .down, .left, .right, .home, .end, .page_up, .page_down => true,
+            .escape, .up, .down, .left, .right, .ctrl_left, .ctrl_right, .home, .end, .page_up, .page_down => true,
             else => false,
         }) self.document.history.endChange();
         const buffer = &self.document.buffer;
@@ -227,9 +270,7 @@ pub const Editor = struct {
             .escape => self.mode = .normal,
             .delete => if (self.mode == .insert) {
                 if (buffer.cursor < buffer.bytes.items.len) {
-                    try self.beginChange();
-                    _ = buffer.deleteForward();
-                    self.changed();
+                    try self.deleteInsertRange(buffer.cursor, buffer.nextIndex(buffer.cursor));
                 }
             } else if (self.selection()) |range| {
                 try self.operate(.delete, range);
@@ -237,12 +278,20 @@ pub const Editor = struct {
             .byte => |byte| {
                 if (self.mode == .insert) switch (byte) {
                     8, 127 => if (buffer.cursor > 0) {
-                        try self.beginChange();
-                        _ = buffer.backspace();
-                        self.changed();
+                        try self.deleteInsertRange(buffer.previousIndex(buffer.cursor), buffer.cursor);
                     },
-                    '\r', '\n' => try self.insert(buffer.newline),
-                    '\t', 32...126 => try self.insert(&.{byte}),
+                    0x17 => if (buffer.cursor > 0) {
+                        const end = buffer.cursor;
+                        const line_start = buffer.lineStart(end);
+                        const start = if (end == line_start)
+                            buffer.previousIndex(end)
+                        else
+                            line_start + content.Buffer.previousWordStart(buffer.bytes.items[line_start..end], end - line_start);
+                        try self.deleteInsertRange(start, end);
+                    },
+                    '\r', '\n' => try self.insertIndentedNewline(),
+                    '\t' => try self.insertTab(),
+                    32...126 => try self.insert(&.{byte}),
                     else => {},
                 } else switch (byte) {
                     'i' => if (!self.isVisual()) {
@@ -345,11 +394,13 @@ pub const Editor = struct {
     }
 
     fn move(self: *Editor, key: terminal.Key, cross_files: bool) !bool {
-        const motion: enum { up, down, left, right, home, end, file_home, file_end, page_up, page_down } = switch (key) {
+        const motion: enum { up, down, left, right, word_left, word_right, home, end, file_home, file_end, page_up, page_down } = switch (key) {
             .up => .up,
             .down => .down,
             .left => .left,
             .right => .right,
+            .ctrl_left => .word_left,
+            .ctrl_right => .word_right,
             .home => .home,
             .end => .end,
             .page_up => .page_up,
@@ -397,8 +448,8 @@ pub const Editor = struct {
         const boundary = switch (motion) {
             .up => buffer.cursor_row == 0,
             .down => down_end.? == buffer.bytes.items.len,
-            .left => buffer.cursor == 0,
-            .right => buffer.cursor == buffer.bytes.items.len,
+            .left, .word_left => buffer.cursor == 0,
+            .right, .word_right => buffer.cursor == buffer.bytes.items.len,
             else => false,
         };
         if (boundary and cross_files and self.stream != null) {
@@ -407,11 +458,12 @@ pub const Editor = struct {
             var stream = self.stream.?;
             stream.async_load = false;
             self.wrap = try stream.canWrap(self.height);
-            const forward = motion == .down or motion == .right;
+            const forward = motion == .down or motion == .right or motion == .word_right;
             if (try stream.adjacent(self.current_file.?, forward, self.wrap)) |index| {
                 const vertical = motion == .up or motion == .down;
                 const column = buffer.preferred_column orelse buffer.cursorColumn();
                 const document = try self.workspace.?.ensure(index);
+                self.discardAutoIndent();
                 self.workspace.?.active_index = index;
                 self.document = document;
                 self.current_file = index;
@@ -436,15 +488,19 @@ pub const Editor = struct {
             }
             return true;
         }
+        const row = buffer.cursor_row;
         switch (motion) {
             .up => buffer.moveUp(),
             .down => buffer.moveDownFromEnd(down_end.?),
             .left => buffer.moveLeft(),
             .right => buffer.moveRight(),
+            .word_left => buffer.setCursor(content.Buffer.previousWordStart(buffer.bytes.items, buffer.cursor)),
+            .word_right => buffer.setCursor(content.Buffer.nextWordStart(buffer.bytes.items, buffer.cursor)),
             .home => buffer.moveHome(),
             .end => buffer.moveEnd(),
             .file_home, .file_end, .page_up, .page_down => unreachable,
         }
+        if (buffer.cursor_row != row) self.discardAutoIndent();
         return true;
     }
 
@@ -531,7 +587,7 @@ pub const Editor = struct {
         if (!std.mem.eql(u8, bytes[start..range.end], replacement)) {
             try self.beginChange();
             try buffer.replaceRange(self.document.allocator, start, range.end, replacement);
-            self.changed();
+            self.changed(.{ .start = start, .old_end = range.end, .new_end = start + replacement.len });
         }
         buffer.setCursor(start);
     }
@@ -588,7 +644,7 @@ pub const Editor = struct {
         if (!std.mem.eql(u8, bytes[start..end], pasted.items)) {
             try self.beginChange();
             try buffer.replaceRange(self.document.allocator, start, end, pasted.items);
-            self.changed();
+            self.changed(.{ .start = start, .old_end = end, .new_end = start + pasted.items.len });
         }
         self.mode = .normal;
         if (self.register_linewise or (selected != null and selected.?.linewise)) {
@@ -605,32 +661,111 @@ pub const Editor = struct {
 
     fn restoreChange(self: *Editor, redo: bool) void {
         const history = &self.document.history;
+        const before = self.document.buffer.bytes.items;
         const restored = if (redo) history.redo(&self.document.buffer) else history.undo(&self.document.buffer);
         if (!restored) {
             self.setMessage("Nothing to {s}", .{if (redo) @as([]const u8, "redo") else "undo"});
             return;
         }
-        self.changed();
+        // A snapshot taken before typing or pasting can contain an untouched indent.
+        self.document.buffer.discardAutoIndent();
+        self.changed(highlight.Edit.between(before, self.document.buffer.bytes.items));
         self.dirty = history.isDirty();
         if (self.current_file) |index| self.workspace.?.entries.items[index].dirty = self.dirty;
     }
 
-    fn changed(self: *Editor) void {
+    fn changed(self: *Editor, edit: highlight.Edit) void {
+        const previous = self.currentRevision();
         self.clearProjection();
-        self.document.highlights.clear();
         self.document_revision +%= 1;
         self.dirty = true;
         if (self.current_file) |index| {
             self.workspace.?.markDirty(index);
+        }
+        if (!self.pasting) {
+            self.document.highlights.rebase(previous, self.currentRevision(), edit, self.document.buffer.bytes.items.len);
         }
         self.message_len = 0;
     }
 
     fn insert(self: *Editor, bytes: []const u8) !void {
         if (bytes.len == 0) return;
+        const start = self.document.buffer.cursor;
         try self.beginChange();
         try self.document.buffer.insert(self.document.allocator, bytes);
-        self.changed();
+        self.document.buffer.auto_indent = null;
+        self.changed(.{ .start = start, .old_end = start, .new_end = start + bytes.len });
+    }
+
+    fn deleteInsertRange(self: *Editor, start: usize, stop: usize) !void {
+        const buffer = &self.document.buffer;
+        var end = stop;
+        var remaining = buffer.auto_indent;
+        var only_auto_indent = false;
+        if (remaining) |*indent| {
+            if (start < indent.start) {
+                // Joining back to the previous line also removes the copied prefix.
+                end = indent.end;
+                remaining = null;
+            } else if (buffer.bytes.items[end - 1] == '\n' and !blankLineTail(buffer.bytes.items[end..])) {
+                remaining = null;
+            } else {
+                only_auto_indent = end <= indent.end;
+                indent.end -= @min(end, indent.end) - @min(start, indent.end);
+                if (indent.end == indent.start) remaining = null;
+            }
+        }
+        if (!only_auto_indent) try self.beginChange();
+        try buffer.replaceRange(self.document.allocator, start, end, "");
+        buffer.auto_indent = remaining;
+        self.changed(.{ .start = start, .old_end = end, .new_end = start });
+    }
+
+    fn insertIndentedNewline(self: *Editor) !void {
+        const buffer = &self.document.buffer;
+        const cursor = buffer.cursor;
+        // Consecutive Enters move the temporary prefix to the new line.
+        const start = if (buffer.auto_indent) |range| range.start else cursor;
+        const copied_end = if (buffer.auto_indent) |range| range.end else cursor;
+        const end = @max(cursor, copied_end);
+        const line_prefix = buffer.bytes.items[buffer.lineStart(cursor)..end];
+        const indent = line_prefix[0 .. std.mem.indexOfNone(u8, line_prefix, " \t") orelse line_prefix.len];
+        if (indent.len == 0) return self.insert(buffer.newline);
+
+        const blank = blankLineTail(buffer.bytes.items[end..]);
+        const retained = buffer.bytes.items[copied_end..end];
+        var scratch = std.heap.stackFallback(128, self.allocator);
+        const allocator = scratch.get();
+        const replacement = try std.mem.concat(allocator, u8, &.{ retained, buffer.newline, indent });
+        defer allocator.free(replacement);
+
+        try buffer.bytes.ensureUnusedCapacity(self.document.allocator, replacement.len - (end - start));
+        try self.beginChange();
+        try buffer.replaceRange(self.document.allocator, start, end, replacement);
+        const new_end = start + replacement.len;
+        buffer.auto_indent = if (blank) .{ .start = new_end - indent.len, .end = new_end } else null;
+        self.changed(.{ .start = start, .old_end = end, .new_end = new_end });
+    }
+
+    fn blankLineTail(bytes: []const u8) bool {
+        const first = std.mem.indexOfNone(u8, bytes, " \t") orelse return true;
+        const suffix = bytes[first..];
+        return suffix[0] == '\n' or std.mem.startsWith(u8, suffix, "\r\n");
+    }
+
+    fn insertTab(self: *Editor) !void {
+        const style = self.document.buffer.indent_style;
+        if (style.kind == .tabs) return self.insert("\t");
+        const padding = [_]u8{' '} ** content.Buffer.max_indent_width;
+        try self.insert(padding[0 .. style.width - self.cursorColumn() % style.width]);
+    }
+
+    fn discardAutoIndent(self: *Editor) void {
+        const buffer = &self.document.buffer;
+        const indent = buffer.auto_indent orelse return;
+        const edit: highlight.Edit = .{ .start = indent.start, .old_end = indent.end, .new_end = indent.start };
+        buffer.discardAutoIndent();
+        self.changed(edit);
     }
 
     fn pasteByte(self: *Editor, byte: u8) !void {
@@ -644,6 +779,128 @@ pub const Editor = struct {
             '\t', 32...126, 128...255 => try self.insert(&.{byte}),
             else => {},
         }
+    }
+
+    fn openPicker(self: *Editor, kind: Picker.Kind) !void {
+        const workspace = self.workspace.?;
+        workspace.cancelRequested();
+        self.picker = .{ .kind = kind };
+        if (kind == .files) {
+            const picker = &self.picker.?;
+            for (workspace.entries.items, 0..) |*entry, index| {
+                if (entry.isBrowsable()) try picker.files.append(self.allocator, index);
+            }
+            try picker.filterFiles(self.allocator, workspace.entries.items);
+        }
+    }
+
+    fn closePicker(self: *Editor) void {
+        self.picker.?.deinit(self.allocator);
+        self.picker = null;
+        self.picker_search_pending = false;
+        if (self.picker_job) |job| job.cancel();
+    }
+
+    fn pickerKey(self: *Editor, key: terminal.Key) !void {
+        const picker = &self.picker.?;
+        const workspace = self.workspace.?;
+        switch (try picker.handle(self.allocator, key)) {
+            .none => {},
+            .close => self.closePicker(),
+            .select => if (picker.selected()) |item| {
+                defer self.closePicker();
+                try self.jumpToPickerItem(item, if (picker.kind == .search) picker.query.items else "");
+            },
+            .query_changed => switch (picker.kind) {
+                .files => try picker.filterFiles(self.allocator, workspace.entries.items),
+                .search => {
+                    picker.resetResults();
+                    picker.searching = picker.query.items.len != 0;
+                    picker.search_failed = false;
+                    self.picker_search_pending = true;
+                    if (self.picker_job) |job| job.cancel();
+                },
+            },
+        }
+    }
+
+    fn jumpToPickerItem(self: *Editor, item: workspace_search.Match, query: []const u8) !void {
+        const workspace = self.workspace.?;
+        const entry = &workspace.entries.items[item.file];
+        if (item.revision) |revision| if (entry.revision != revision) {
+            self.setMessage("Search match changed: {s}", .{entry.name});
+            return;
+        };
+        const document = workspace.ensure(item.file) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            self.setMessage("Could not open {s}: {s}", .{ entry.name, @errorName(err) });
+            return;
+        };
+        const bytes = document.buffer.bytes.items;
+        if (item.offset > bytes.len or !std.mem.startsWith(u8, bytes[item.offset..], query)) {
+            self.setMessage("Search match changed: {s}", .{entry.name});
+            return;
+        }
+        workspace.active_index = item.file;
+        if (self.owns_document) {
+            self.document.deinit();
+            self.allocator.destroy(self.document);
+            self.owns_document = false;
+        }
+        self.document = document;
+        self.current_file = item.file;
+        self.filename = entry.name;
+        self.dirty = entry.dirty;
+        self.clearProjection();
+        // Resident matches are revision checked. Disk matches may have moved
+        // to a different line since scanning, so recompute their row on open.
+        if (item.revision != null) {
+            document.buffer.cursor = item.offset;
+            document.buffer.cursor_row = item.row;
+            document.buffer.preferred_column = null;
+        } else document.buffer.setCursor(item.offset);
+        self.screen_row = 0;
+        self.left_column = 0;
+        self.message_len = 0;
+        self.transitions +%= 1;
+    }
+
+    fn pollPickerSearch(self: *Editor) !void {
+        if (self.picker_job) |job| {
+            const done = job.isDone();
+            if (self.picker) |*picker| {
+                if (picker.kind == .search and !self.picker_search_pending and picker.searching) {
+                    if (try job.poll(self, searchSource, self.allocator, &picker.items)) self.background_redraw = true;
+                    if (done) {
+                        picker.searching = false;
+                        self.background_redraw = true;
+                    }
+                }
+            }
+            if (!done) return;
+            job.deinit();
+            self.picker_job = null;
+        }
+        if (!self.picker_search_pending) return;
+        self.picker_search_pending = false;
+        const picker = &self.picker.?;
+        if (!picker.searching) return;
+        const workspace = self.workspace.?;
+        if (workspace.entries.items.len == 0) {
+            picker.searching = false;
+            self.background_redraw = true;
+            return;
+        }
+        self.picker_job = workspace_search.Job.start(self.allocator, picker.query.items, .{
+            .entries = workspace.entries.items,
+            .resident = workspace.resident.items,
+            .cell = searchCell,
+        }) catch {
+            picker.searching = false;
+            picker.search_failed = true;
+            self.background_redraw = true;
+            return;
+        };
     }
 
     fn cancelSearch(self: *Editor) void {
@@ -666,6 +923,7 @@ pub const Editor = struct {
                         self.search_text.shrinkRetainingCapacity(end);
                     }
                 },
+                0x17 => self.search_text.shrinkRetainingCapacity(content.Buffer.previousWordStart(self.search_text.items, self.search_text.items.len)),
                 '\r', '\n' => {
                     self.search_prompt = false;
                     if (self.search_text.items.len != 0) {
@@ -745,6 +1003,7 @@ pub const Editor = struct {
     }
 
     fn pollBackground(self: *Editor) !void {
+        try self.pollPickerSearch();
         if (self.workspace) |workspace| {
             if (try workspace.pollRequested()) self.background_redraw = true;
         }
@@ -817,12 +1076,13 @@ pub const Editor = struct {
     fn startHighlight(self: *Editor, file: usize) bool {
         const source = self.highlightSource(file) orelse return false;
         const cache = &source.document.highlights;
-        if (cache.revision == source.revision) return false;
+        if (cache.revision == source.revision and !cache.needs_scan) return false;
         const language = highlight.Language.detect(source.filename) orelse return false;
         const bytes = source.document.buffer.bytes.items;
         if (bytes.len == 0 or bytes.len > highlight.max_source_bytes) return false;
         self.highlight_job = highlight.Job.start(file, source.revision, language, bytes) catch {
             // Highlighting is optional. Retry only after the text changes.
+            if (cache.get(source.revision).len != 0) self.background_redraw = true;
             cache.clear();
             cache.revision = source.revision;
             return false;
@@ -933,6 +1193,7 @@ pub const Editor = struct {
                         self.command_active = false;
                     } else _ = self.command.pop();
                 },
+                0x17 => self.command.shrinkRetainingCapacity(content.Buffer.previousWordStart(self.command.items, self.command.items.len)),
                 '\r', '\n' => {
                     self.command_active = false;
                     return self.executeCommand();
@@ -1020,6 +1281,10 @@ pub const Editor = struct {
     /// Prepare the same complete frame used by the terminal loop, without I/O.
     /// The returned bytes are borrowed until the next frame or deinit.
     pub fn renderFrame(self: *Editor, size: terminal.Size) ![]const u8 {
+        if (self.picker) |*picker| {
+            try picker.render(self.allocator, &self.frame, size, self.workspace.?.entries.items);
+            return self.frame.items;
+        }
         if (self.search_projection != null and
             (self.projection_document != self.document or self.projection_revision != self.currentRevision())) self.clearProjection();
         const async_workspace = if (self.stream != null and self.stream.?.async_load) self.workspace else null;
@@ -1037,16 +1302,24 @@ pub const Editor = struct {
         if (self.stream) |*stream| self.wrap = try stream.canWrap(self.height);
         const cursor_row = buffer.cursor_row;
         const cursor_column = self.cursorColumn();
-        if (cursor_column < self.left_column) self.left_column = cursor_column;
-        if (cursor_column >= self.left_column + size.cols) self.left_column = cursor_column - size.cols + 1;
 
-        var first = Row{ .file = self.current_file orelse 0, .start = self.lineStart(buffer.cursor) };
+        var first = Row{ .file = self.current_file orelse 0, .start = self.lineStart(buffer.cursor), .number = cursor_row + 1 };
+        // Later files start at 1, so their visible numbers cannot exceed the viewport height.
+        var max_line_number = @max(buffer.line_count, self.height);
         var back: usize = 0;
         while (back < self.screen_row) : (back += 1) {
             first = try self.stepRow(first, false) orelse break;
+            max_line_number = @max(max_line_number, first.number);
         }
         self.screen_row = back;
-        var visible: ?Row = if (self.workspace != null and self.current_file == null) null else first;
+        const empty_workspace = self.workspace != null and self.current_file == null;
+        const desired_gutter = @max(3, std.fmt.count("{d}", .{max_line_number})) + 1;
+        const gutter = if (!empty_workspace and desired_gutter < size.cols) desired_gutter else 0;
+        const text_width = size.cols - gutter;
+        if (cursor_column < self.left_column) self.left_column = cursor_column;
+        if (cursor_column - self.left_column >= text_width) self.left_column = cursor_column - text_width + 1;
+
+        var visible: ?Row = if (empty_workspace) null else first;
         for (0..self.height) |row| {
             try self.print("\x1b[{d};1H\x1b[2K", .{row + 1});
             if (visible) |line| {
@@ -1060,18 +1333,20 @@ pub const Editor = struct {
                     const projection = if (document == self.document and self.search_projection != null and self.search_projection.?.line_start == start) self.search_projection else null;
                     const end = if (projection) |prepared| prepared.line_end else document.buffer.lineEnd(start);
                     rendered.end = end;
+                    if (gutter != 0) try self.print("\x1b[90m{d:[1]}\x1b[39m ", .{ line.number, gutter - 1 });
                     if (self.workspace == null or line.file == self.current_file) {
-                        try self.drawLine(start, end, size.cols);
+                        try self.drawLine(start, end, text_width);
                     } else {
                         const spans = document.highlights.get(self.workspace.?.entries.items[line.file].revision);
-                        try self.drawStyledTextFrom(document.buffer.bytes.items[start..end], self.left_column, size.cols, null, start, 0, spans);
+                        try self.drawStyledTextFrom(document.buffer.bytes.items[start..end], self.left_column, text_width, null, start, 0, spans);
                     }
                 }
                 // Do not prefetch a file below the last visible row.
                 if (row + 1 < self.height) visible = try self.stepRow(rendered, true);
-            } else if (self.current_file == null and self.workspace != null and row == 0) {
+            } else if (empty_workspace and row == 0) {
                 try self.drawText("No readable files in this workspace", 0, size.cols);
             } else {
+                try self.spaces(gutter);
                 try self.append("\x1b[90m~\x1b[0m");
             }
         }
@@ -1110,15 +1385,17 @@ pub const Editor = struct {
                 " y yank   d delete   c change   p paste   Escape cancel"
             else if (self.pending_operator != null)
                 " Motion or repeat operator; Escape cancels"
+            else if (self.pending_space)
+                " f files   g search files"
             else
-                " i insert   / search   n next   v/V select   :w all   :wt file   :q quit", 0, size.cols);
+                " i insert   / search   Space f files   Space g search files   :q quit", 0, size.cols);
         }
         if (self.search_prompt) {
             try self.print("\x1b[{d};{d}H\x1b[6 q", .{ size.rows, @min(display.columns(self.search_text.items) + 2, size.cols) });
         } else if (self.command_active) {
             try self.print("\x1b[{d};{d}H\x1b[6 q", .{ size.rows, @min(self.command.items.len + 2, size.cols) });
         } else {
-            try self.print("\x1b[{d};{d}H", .{ self.screen_row + 1, cursor_column - self.left_column + 1 });
+            try self.print("\x1b[{d};{d}H", .{ self.screen_row + 1, gutter + cursor_column - self.left_column + 1 });
             try self.append(if (self.mode == .insert) "\x1b[6 q" else "\x1b[2 q");
         }
         try self.append("\x1b[?25h\x1b[?2026l");
@@ -1133,9 +1410,9 @@ pub const Editor = struct {
         const buffer = &self.document.buffer;
         if (forward) {
             const end = row.end orelse buffer.lineEnd(row.start);
-            return if (end < buffer.bytes.items.len) Row{ .file = 0, .start = buffer.nextIndex(end) } else null;
+            return if (end < buffer.bytes.items.len) Row{ .file = 0, .start = buffer.nextIndex(end), .number = row.number + 1 } else null;
         }
-        return if (row.start > 0) Row{ .file = 0, .start = buffer.lineStart(buffer.previousIndex(row.start)) } else null;
+        return if (row.start > 0) Row{ .file = 0, .start = buffer.lineStart(buffer.previousIndex(row.start)), .number = row.number - 1 } else null;
     }
 
     fn drawLine(self: *Editor, start: usize, end: usize, width: usize) !void {
@@ -1288,6 +1565,155 @@ test "insert movement and bracketed paste separate undo steps" {
     try std.testing.expectEqualStrings("AéBz", doc.buffer.bytes.items);
 }
 
+test "indentation on an untouched line disappears after leaving it" {
+    const original = "top\r\n  \tchild\r\nnext";
+    const cleaned = "top\r\n  \tchild\r\n\r\nnext";
+    var doc = try testingDocument(original);
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "unused");
+    defer editor.deinit();
+
+    try typeKeys(&editor, "j$i\r");
+    try std.testing.expectEqualStrings("top\r\n  \tchild\r\n  \t\r\nnext", doc.buffer.bytes.items);
+    try std.testing.expectEqual(@as(usize, 3), doc.buffer.cursorColumn());
+    _ = try editor.handle(.left);
+    try typeKeys(&editor, "\x08");
+    try std.testing.expectEqualStrings("top\r\n  \tchild\r\n \t\r\nnext", doc.buffer.bytes.items);
+    _ = try editor.handle(.down);
+    try std.testing.expectEqualStrings(cleaned, doc.buffer.bytes.items);
+    try std.testing.expectEqual(@as(usize, 3), doc.buffer.cursor_row);
+    _ = try editor.handle(.up);
+    try std.testing.expectEqual(@as(usize, 2), doc.buffer.cursor_row);
+    try std.testing.expectEqual(@as(usize, 0), doc.buffer.cursorColumn());
+    try typeKeys(&editor, "\x1bu");
+    try std.testing.expectEqualStrings(original, doc.buffer.bytes.items);
+    try typeKeys(&editor, "r");
+    try std.testing.expectEqualStrings(cleaned, doc.buffer.bytes.items);
+}
+
+test "indentation survives a split and consecutive Enters keep blank lines clean" {
+    var doc = try testingDocument("  child");
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "unused");
+    defer editor.deinit();
+
+    doc.buffer.setCursor("  ch".len);
+    try typeKeys(&editor, "i\r");
+    try std.testing.expectEqualStrings("  ch\n  ild", doc.buffer.bytes.items);
+    _ = try editor.handle(.end);
+    try typeKeys(&editor, "\r\r");
+    try std.testing.expectEqualStrings("  ch\n  ild\n\n  ", doc.buffer.bytes.items);
+
+    _ = try editor.handle(.paste_start);
+    try typeKeys(&editor, "\tword\n z");
+    _ = try editor.handle(.paste_end);
+    try typeKeys(&editor, "\x1b");
+    try std.testing.expectEqualStrings("  ch\n  ild\n\n  \tword\n z", doc.buffer.bytes.items);
+    try typeKeys(&editor, "u");
+    try std.testing.expectEqualStrings("  ch\n  ild\n\n", doc.buffer.bytes.items);
+    try typeKeys(&editor, "r");
+    try std.testing.expectEqualStrings("  ch\n  ild\n\n  \tword\n z", doc.buffer.bytes.items);
+}
+
+test "indentation cleanup preserves existing whitespace on a split line" {
+    const original = "  child  \n\nnext";
+    var doc = try testingDocument(original);
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "unused");
+    defer editor.deinit();
+    doc.buffer.setCursor("  child".len);
+
+    try typeKeys(&editor, "i\r");
+    try std.testing.expectEqualStrings("  child\n    \n\nnext", doc.buffer.bytes.items);
+    _ = try editor.handle(.home);
+    try typeKeys(&editor, "\x08");
+    try std.testing.expectEqualStrings(original, doc.buffer.bytes.items);
+
+    try typeKeys(&editor, "\r");
+    _ = try editor.handle(.end);
+    _ = try editor.handle(.delete);
+    try typeKeys(&editor, "\x1b");
+    try std.testing.expectEqualStrings("  child\n  \nnext", doc.buffer.bytes.items);
+}
+
+test "indentation uses each opened file's style and defaults to four spaces" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = "root\n  child" });
+    try temp.dir.writeFile(.{ .sub_path = "b", .data = "root\n\tchild" });
+    try temp.dir.writeFile(.{ .sub_path = "c", .data = "" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    var editor = try Editor.initWorkspace(std.testing.allocator, &workspace);
+    defer editor.deinit();
+    const first = editor.document;
+
+    try typeKeys(&editor, "i\t");
+    try std.testing.expectEqualStrings("  root\n  child", first.buffer.bytes.items);
+    _ = try editor.handle(.down);
+    _ = try editor.handle(.end);
+    try typeKeys(&editor, "\r");
+    _ = try editor.handle(.right);
+    try std.testing.expectEqualStrings("  root\n  child\n", first.buffer.bytes.items);
+    try typeKeys(&editor, "\t\x1b");
+    try std.testing.expectEqualStrings("\troot\n\tchild", editor.document.buffer.bytes.items);
+
+    try typeKeys(&editor, "GGi\tx\t");
+    try std.testing.expectEqualStrings("    x   ", editor.document.buffer.bytes.items);
+}
+
+test "word arrows cross punctuation and CRLF and end insert undo groups" {
+    const original = "one.café \r\n  two";
+    const last_word = "one.café \r\n  ".len;
+    var doc = try testingDocument(original);
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "unused");
+    defer editor.deinit();
+
+    for ([_]usize{ 3, 4, last_word }) |cursor| {
+        _ = try editor.handle(.ctrl_right);
+        try std.testing.expectEqual(cursor, doc.buffer.cursor);
+    }
+    try std.testing.expectEqual(@as(usize, 1), doc.buffer.cursor_row);
+    _ = try editor.handle(.ctrl_left);
+    try std.testing.expectEqual(@as(usize, 4), doc.buffer.cursor);
+    try std.testing.expectEqual(@as(usize, 0), doc.buffer.cursor_row);
+
+    try typeKeys(&editor, "iX");
+    _ = try editor.handle(.ctrl_right);
+    try typeKeys(&editor, "Y\x1bu");
+    try std.testing.expectEqualStrings("one.Xcafé \r\n  two", doc.buffer.bytes.items);
+    try typeKeys(&editor, "u");
+    try std.testing.expectEqualStrings(original, doc.buffer.bytes.items);
+}
+
+test "Ctrl+W deletes the previous word in insert mode and prompts" {
+    const original = "one\r\ncafé  two";
+    var doc = try testingDocument(original);
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "unused");
+    defer editor.deinit();
+    doc.buffer.moveDown();
+    doc.buffer.moveEnd();
+    try typeKeys(&editor, "i\x17");
+    try std.testing.expectEqualStrings("one\r\ncafé  ", doc.buffer.bytes.items);
+    try typeKeys(&editor, "\x17");
+    try std.testing.expectEqualStrings("one\r\n", doc.buffer.bytes.items);
+    try typeKeys(&editor, "\x17");
+    try std.testing.expectEqualStrings("one", doc.buffer.bytes.items);
+    try typeKeys(&editor, "\x1bu");
+    try std.testing.expectEqualStrings(original, doc.buffer.bytes.items);
+
+    try typeKeys(&editor, ":one two\x17");
+    try std.testing.expectEqualStrings("one ", editor.command.items);
+    try typeKeys(&editor, "\x1b/one ");
+    _ = try editor.handle(.{ .text = .{ .bytes = .{ 0xc3, 0xa9, 0, 0 }, .len = 2 } });
+    try typeKeys(&editor, "\x17");
+    try std.testing.expectEqualStrings("one ", editor.search_text.items);
+}
+
 test "undo steps preserve scalars and CRLF through insert deletion" {
     var doc = try testingDocument("aé\r\nz");
     defer doc.deinit();
@@ -1372,6 +1798,24 @@ test "horizontal clipping does not emit half a wide character" {
     defer editor.deinit();
     try editor.drawText("界x", 1, 2);
     try std.testing.expectEqualStrings(" x", editor.frame.items);
+}
+
+test "line number gutter stays aligned during horizontal scroll and resize" {
+    var doc = try testingDocument(("\n" ** 999) ++ "abcdefghi\nnext");
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "unused");
+    defer editor.deinit();
+    doc.buffer.setCursor(999 + 7);
+    editor.screen_row = 1;
+
+    const frame = try editor.renderFrame(.{ .rows = 5, .cols = 10 });
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[1;1H\x1b[2K\x1b[90m 999\x1b[39m ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[2;1H\x1b[2K\x1b[90m1000\x1b[39m defgh\x1b[3;1H") != null);
+    try std.testing.expect(std.mem.endsWith(u8, frame, "\x1b[2;10H\x1b[2 q\x1b[?25h\x1b[?2026l"));
+
+    const narrow = try editor.renderFrame(.{ .rows = 5, .cols = 4 });
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[2;1H\x1b[2Kefgh\x1b[3;1H") != null);
+    try std.testing.expect(std.mem.endsWith(u8, narrow, "\x1b[2;4H\x1b[2 q\x1b[?25h\x1b[?2026l"));
 }
 
 fn testingDocument(text: []const u8) !content.Document {
@@ -1554,8 +1998,8 @@ test "rendered long lines cross CRLF, empty lines, and file boundaries" {
     var editor = try Editor.initWorkspace(allocator, &workspace);
     defer editor.deinit();
     const frame = try editor.renderFrame(.{ .rows = 10, .cols = 80 });
-    try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[2;1H\x1b[2Ktail") != null);
-    try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[6;1H\x1b[2Ksecond") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[2;1H\x1b[2K\x1b[90m  2\x1b[39m tail") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[4;1H\x1b[2K\x1b[90m  4\x1b[39m \x1b[5;1H\x1b[2K\x1b[6;1H\x1b[2K\x1b[90m  1\x1b[39m second") != null);
     try typeKeys(&editor, "jjjjj");
     try std.testing.expectEqual(@as(?usize, 1), editor.current_file);
     try expectStatusRow(&editor, 2);
@@ -1817,6 +2261,83 @@ fn finishSearch(editor: *Editor) !void {
     }
 }
 
+test "file picker consumes its prefix, filters browsable paths, and jumps to file start" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = ".gitignore", .data = "ignored.txt\n" });
+    try temp.dir.writeFile(.{ .sub_path = "ignored.txt", .data = "ignored" });
+    try temp.dir.writeFile(.{ .sub_path = "target.txt", .data = "  first\nsecond" });
+    const oversized = try temp.dir.createFile("too-big.txt", .{});
+    defer oversized.close();
+    try oversized.setEndPos(content.max_file_size + 1);
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    var editor = try Editor.initWorkspace(std.testing.allocator, &workspace);
+    defer editor.deinit();
+    try typeKeys(&editor, "l ");
+    _ = try editor.handle(.tick);
+    try std.testing.expect(editor.pending_space);
+    try typeKeys(&editor, "i");
+    try std.testing.expectEqual(Mode.normal, editor.mode);
+    try std.testing.expect(!editor.pending_space);
+    try typeKeys(&editor, " f");
+    const size: terminal.Size = .{ .rows = 5, .cols = 80 };
+    const frame = try editor.renderFrame(size);
+    try std.testing.expectEqual(@as(usize, 2), editor.picker.?.items.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "target.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "too-big.txt") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "ignored.txt") == null);
+    try std.testing.expectEqual(@as(usize, 1), workspace.resident.items.len);
+    try typeKeys(&editor, "\x1b");
+    try std.testing.expectEqual(@as(usize, 1), editor.document.buffer.cursor);
+    try typeKeys(&editor, " fTARGET\r");
+    try std.testing.expect(editor.picker == null);
+    try std.testing.expectEqualStrings("target.txt", editor.filename);
+    try std.testing.expectEqual(@as(usize, 0), editor.document.buffer.cursor);
+    try std.testing.expectEqual(@as(usize, 0), editor.screen_row);
+}
+
+test "search picker streams dirty and unloaded matches and opens the exact location" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const distant = "before\r\n\t界 needle needle";
+    try temp.dir.writeFile(.{ .sub_path = "a.txt", .data = "other\n" });
+    try temp.dir.writeFile(.{ .sub_path = "b.txt", .data = distant });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    var editor = try Editor.initWorkspace(std.testing.allocator, &workspace);
+    defer editor.deinit();
+    try typeKeys(&editor, "ineedle\x1b g");
+    try std.testing.expectEqual(@as(usize, 0), editor.picker.?.items.items.len);
+    try typeKeys(&editor, "other");
+    _ = try editor.handle(.tick);
+    try std.testing.expect(editor.picker_job != null);
+    try typeKeys(&editor, "\x17needle");
+    var timer = try std.time.Timer.start();
+    while (editor.picker.?.searching) {
+        if (timer.read() > 5 * std.time.ns_per_s) return error.SearchDidNotFinish;
+        _ = try editor.handle(.tick);
+        std.Thread.sleep(100 * std.time.ns_per_us);
+    }
+    try std.testing.expectEqual(@as(usize, 3), editor.picker.?.items.items.len);
+    try std.testing.expect(workspace.entries.items[1].document == null);
+    const frame = try editor.renderFrame(.{ .rows = 6, .cols = 80 });
+    try std.testing.expect(std.mem.indexOf(u8, frame, "a.txt:1:1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "b.txt:2:8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "b.txt:2:15") != null);
+    _ = try editor.handle(.end);
+    try typeKeys(&editor, "\r");
+    try std.testing.expect(editor.picker == null);
+    try std.testing.expectEqualStrings("b.txt", editor.filename);
+    try std.testing.expectEqual(std.mem.lastIndexOf(u8, distant, "needle").?, editor.document.buffer.cursor);
+    try std.testing.expectEqual(@as(usize, 1), editor.document.buffer.cursor_row);
+    try std.testing.expectEqual(@as(usize, 14), editor.cursorColumn());
+}
+
 test "workspace scanning neither admits buffers nor changes cache recency" {
     var temp = std.testing.tmpDir(.{});
     defer temp.cleanup();
@@ -1955,6 +2476,58 @@ test "syntax highlighting drops stale work and colors each visible file" {
     const frame = try editor.renderFrame(size);
     try std.testing.expect(std.mem.indexOf(u8, frame, try std.fmt.bufPrint(&expected, "\x1b[7m{s}/\x1b[27m/ const n = 42;\x1b[39m", .{comment_color})) != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, try std.fmt.bufPrint(&expected, "{s}int\x1b[39m n;", .{keyword_color})) != null);
+}
+
+test "syntax highlighting keeps colors through identifier edits and updates changed keywords" {
+    var doc = try testingDocument("name = return");
+    defer doc.deinit();
+    var editor = Editor.init(std.testing.allocator, &doc, "example.zig");
+    defer editor.deinit();
+    editor.highlight_enabled = true;
+    editor.pollHighlights();
+    try waitForHighlight(&editor);
+    editor.pollHighlights();
+    editor.background_redraw = false;
+
+    const size: terminal.Size = .{ .rows = 5, .cols = 40 };
+    const keyword_color = syntax_theme.foreground(.keyword);
+    const reset = syntax_theme.foreground(null);
+    var expected: [128]u8 = undefined;
+
+    doc.buffer.setCursor("na".len);
+    try typeKeys(&editor, "iX");
+    const frame = try editor.renderFrame(size);
+    const colored_line = try std.fmt.bufPrint(&expected, "naXme = {s}return{s}", .{ keyword_color, reset });
+    try std.testing.expect(std.mem.indexOf(u8, frame, colored_line) != null);
+    editor.pollHighlights();
+    try waitForHighlight(&editor);
+    editor.pollHighlights();
+    try std.testing.expect(!editor.background_redraw);
+
+    doc.buffer.setCursor(doc.buffer.bytes.items.len);
+    for ([_]u8{ 'x', 8 }, [_][]const u8{ "naXme = returnx", colored_line }) |key, line| {
+        editor.background_redraw = false;
+        _ = try editor.handle(.{ .byte = key });
+        editor.pollHighlights();
+        try waitForHighlight(&editor);
+        editor.pollHighlights();
+        try std.testing.expect(editor.background_redraw);
+        const updated = try editor.renderFrame(size);
+        try std.testing.expect(std.mem.indexOf(u8, updated, line) != null);
+    }
+
+    doc.buffer.setCursor(0);
+    _ = try editor.handle(.paste_start);
+    try typeKeys(&editor, "plain\n");
+    _ = try editor.handle(.paste_end);
+    const pasted = try editor.renderFrame(size);
+    try std.testing.expect(std.mem.indexOf(u8, pasted, "plain") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pasted, colored_line) != null);
+
+    try typeKeys(&editor, "\x1bu");
+    const undone = try editor.renderFrame(size);
+    try std.testing.expectEqualStrings("naXme = return", doc.buffer.bytes.items);
+    try std.testing.expect(std.mem.indexOf(u8, undone, colored_line) != null);
 }
 
 fn waitForHighlight(editor: *const Editor) !void {

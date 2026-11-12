@@ -2,10 +2,12 @@
 pub const Buffer = @import("buffer.zig").Buffer;
 pub const Document = @import("storage.zig").Document;
 pub const Workspace = @import("workspace.zig").Workspace;
+pub const WorkspaceEntry = @import("workspace.zig").Entry;
 pub const max_file_size = @import("storage.zig").max_file_size;
 pub const cache_file_limit = @import("workspace.zig").cache_file_limit;
 pub const cache_byte_limit = @import("workspace.zig").cache_byte_limit;
 pub const search = @import("search.zig");
+pub const workspace_search = @import("workspace_search.zig");
 pub const highlight = @import("highlight/root.zig");
 
 test {
@@ -14,5 +16,6 @@ test {
     _ = @import("storage.zig");
     _ = @import("workspace.zig");
     _ = @import("search.zig");
+    _ = workspace_search;
     _ = highlight;
 }

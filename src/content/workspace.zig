@@ -19,6 +19,17 @@ pub const Entry = struct {
     allow_new: bool = false,
     // Changes to contents or residency invalidate borrowed search positions.
     revision: u64 = 0,
+
+    /// Check whether an unloaded entry can be listed without reading its text.
+    pub fn isBrowsable(self: *const Entry) bool {
+        if (self.document != null) return true;
+        if (self.load_error != null) return false;
+        const fd = std.posix.open(self.path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOFOLLOW = true }, 0) catch return false;
+        const file = std.fs.File{ .handle = fd };
+        defer file.close();
+        const stat = file.stat() catch return false;
+        return stat.kind == .file and stat.size <= storage.max_file_size;
+    }
 };
 
 pub const SaveAllResult = struct {

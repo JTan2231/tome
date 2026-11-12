@@ -26,6 +26,8 @@ const usage =
     \\  y/d/c + hjkl, 0, $, gg, G, arrows, Home, End operate on a motion
     \\  /text   search forward (literal, case-sensitive; Enter starts)
     \\  n       next match; Escape cancels a pending search
+    \\  Space f filter workspace files and jump to the selected file
+    \\  Space g search workspace text and jump to the selected match
     \\  :w      write all changed files
     \\  :wt     write the file under the cursor
     \\  :q      quit (refuses unsaved changes)
