@@ -40,7 +40,7 @@ fn run() !void {
     try runScroll(allocator, args[1], steps, rows, cols, &output);
 }
 
-fn runScroll(allocator: std.mem.Allocator, root: []const u8, steps: usize, rows: usize, cols: usize, sink: anytype) !void {
+pub fn runScroll(allocator: std.mem.Allocator, root: []const u8, steps: usize, rows: usize, cols: usize, sink: anytype) !void {
     var timer = try std.time.Timer.start();
     var workspace = try content.Workspace.open(allocator, root, null);
     const discovery_ns = timer.read();

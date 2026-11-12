@@ -2,4 +2,3 @@
 zig-out/
 /src/tome
 measurement/results/
-__pycache__/

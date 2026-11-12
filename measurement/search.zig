@@ -3,75 +3,127 @@ const std = @import("std");
 const builtin = @import("builtin");
 const content = @import("content");
 const Editor = @import("editor").Editor;
+const common = @import("common.zig");
+const fixtures = @import("search_fixtures.zig");
+const Config = fixtures.Config;
 
 const usage =
-    \\Usage: tome-search <workspace-root> <config.json>
+    \\Usage: zig build benchmark-search -- [options]
     \\
-    \\Run a literal search in a fresh editor for each repetition. Configuration
-    \\specifies the origin, expected destination, viewport, and target preload.
-    \\Write build metadata, validated timings, and completion as JSON lines.
+    \\  --repetitions N    Samples per scenario (default 30)
+    \\  --scenario PREFIX  Select matching scenarios (repeatable)
+    \\  --list             Print selected scenarios without running them
+    \\  --output PATH      Write to a new JSONL file
+    \\  -h, --help         Print this help
     \\
 ;
 
-const Config = struct {
-    repetitions: usize,
-    rows: usize = 40,
-    cols: usize = 120,
-    origin_file: usize = 0,
-    origin_offset: usize = 0,
-    target_file: ?usize = null,
-    target_offset: ?usize = null,
-    preload_target: bool = false,
-    query: []const u8,
-    expected_message: []const u8,
-
-    fn validate(self: Config) !void {
-        if (self.repetitions == 0) return error.InvalidRepetitions;
-        if (self.rows < 3 or self.cols < 2) return error.InvalidViewport;
-        if ((self.target_file == null) != (self.target_offset == null)) return error.InvalidTarget;
-        if (self.preload_target and self.target_file == null) return error.InvalidTarget;
-        if (self.query.len == 0 or self.query.len > content.search.max_query_size) return error.InvalidQuery;
-        // Generated scenarios use one printable ASCII literal, entered through
-        // exactly the same key handling as a user typing it into the prompt.
-        for (self.query) |byte| if (byte < 32 or byte > 126) return error.InvalidQuery;
-        if (self.target_file == null) {
-            if (!std.mem.eql(u8, self.expected_message, "Pattern not found")) return error.InvalidExpectedMessage;
-        } else if (!std.mem.eql(u8, self.expected_message, "Match") and
-            !std.mem.eql(u8, self.expected_message, "Search wrapped")) return error.InvalidExpectedMessage;
-    }
-};
-
 pub fn main() void {
     run() catch |err| {
-        std.debug.print("tome-search: {s}\n", .{@errorName(err)});
+        std.debug.print("benchmark-search: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
 }
 
 fn run() !void {
-    const allocator = std.heap.page_allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-    var output: Output = .{ .allocator = allocator, .file = .{ .handle = std.posix.STDOUT_FILENO } };
-    if (args.len == 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))) {
-        try output.file.writeAll(usage);
-        return;
+    const options = common.ScenarioOptions.parse(allocator, args[1..]) catch |err| {
+        std.debug.print("{s}benchmark-search: {s}\n", .{ usage, @errorName(err) });
+        std.process.exit(2);
+    } orelse return common.print("{s}", .{usage});
+    var matched = false;
+    for (fixtures.scenarios) |case| {
+        if (!options.selects(case.name)) continue;
+        matched = true;
+        if (options.list) try common.print("{s}\n", .{case.name});
     }
-    if (args.len != 3) {
-        std.debug.print("{s}", .{usage});
-        return error.ExpectedWorkspaceAndConfig;
-    }
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, args[2], 64 * 1024);
-    defer allocator.free(bytes);
-    const config = try std.json.parseFromSlice(Config, allocator, bytes, .{});
-    defer config.deinit();
-    try runSearch(allocator, args[1], config.value, &output);
+    if (!matched) return error.NoMatchingScenarios;
+    if (options.list) return;
+
+    common.installInterruptHandler();
+    const path = try common.resultPath(allocator, options.output_path, "search-", null);
+    const file = try common.createResult(path);
+    defer file.close();
+    var buffer: [16 * 1024]u8 = undefined;
+    var writer = file.writer(&buffer);
+    const output = &writer.interface;
+    runSuite(allocator, options, path, output) catch |err| {
+        common.finish(output, err) catch {};
+        return err;
+    };
+    try common.finish(output, null);
 }
 
-fn runSearch(allocator: std.mem.Allocator, root: []const u8, config: Config, sink: anytype) !void {
-    try config.validate();
-    try sink.json(.{
+fn runSuite(allocator: std.mem.Allocator, options: common.ScenarioOptions, path: []const u8, output: *std.Io.Writer) !void {
+    try common.emitRun(output, try common.runMetadata(allocator), .{
+        .suite = "search",
+        .suite_version = 1,
+        .generator_version = 1,
+        .repetitions = options.repetitions,
+        .rows = fixtures.rows,
+        .cols = fixtures.cols,
+        .warmups = "none discarded; new workspace and editor for each sample",
+        .boundary = "Enter submission through search completion and first result frame",
+        .scheduling = "headless tick servicing with Thread.yield; no terminal poll delay",
+        .distance = "bytes before match start in forward order, excluding origin byte; positional, not bytes actually read",
+        .excluded = "fixture generation, discovery, initial file loading/frame, preload, query entry, JSON reporting, terminal I/O/display",
+        .os_cache = "uncontrolled; fixtures just generated",
+        .fixture_storage = "system temporary directory; deleted after each scenario",
+    });
+    try common.print("Results: {s}\n", .{path});
+    try common.print("Scenario                        n   Median ms      p95 ms      Min ms      Max ms\n", .{});
+    if (content.max_file_size != fixtures.max_file_size) return error.UnexpectedFileSizeLimit;
+    for (fixtures.scenarios) |case| {
+        if (!options.selects(case.name)) continue;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const scoped = arena.allocator();
+        try common.checkInterrupted();
+        var temporary = try common.TempDir.init(scoped, "tome-search-");
+        defer temporary.deinit();
+        var directory = try std.fs.openDirAbsolute(temporary.path, .{});
+        defer directory.close();
+        try directory.makeDir("workspace");
+        var workspace = try directory.openDir("workspace", .{});
+        defer workspace.close();
+        const root = try std.fs.path.join(scoped, &.{ temporary.path, "workspace" });
+        const metadata = try fixtures.generate(scoped, workspace, case, options.repetitions);
+        const summary = try runScenario(scoped, root, metadata, output);
+        try common.print("{s:<28} {d:>4} {d:>11.3} {d:>11.3} {d:>11.3} {d:>11.3}\n", .{
+            summary.scenario,
+            summary.sample_count,
+            summary.median_ns / std.time.ns_per_ms,
+            milliseconds(summary.p95_ns),
+            milliseconds(summary.min_ns),
+            milliseconds(summary.max_ns),
+        });
+    }
+}
+
+const Summary = struct {
+    type: []const u8 = "summary",
+    scenario: []const u8,
+    metric: []const u8 = "search_to_frame",
+    sample_count: usize,
+    median_ns: f64,
+    p95_ns: u64,
+    min_ns: u64,
+    max_ns: u64,
+    outcome: []const u8,
+    search_distance_bytes: ?usize,
+    file_boundaries_before_match: ?usize,
+    target_resident_before: ?bool,
+};
+
+fn runScenario(allocator: std.mem.Allocator, root: []const u8, metadata: fixtures.Metadata, output: *std.Io.Writer) !Summary {
+    const config = metadata.config;
+    try common.emit(output, metadata);
+    try common.emit(output, .{
         .type = "worker",
+        .scenario = metadata.scenario,
         .optimize = @tagName(builtin.mode),
         .zig_version = builtin.zig_version_string,
         .os = @tagName(builtin.os.tag),
@@ -86,13 +138,101 @@ fn runSearch(allocator: std.mem.Allocator, root: []const u8, config: Config, sin
         .polling = "dense editor ticks with thread yield; no terminal poll wait",
         .timeout_ns = 30 * std.time.ns_per_s,
     });
-    for (0..config.repetitions) |iteration| {
-        try runSample(allocator, root, config, iteration, sink);
+
+    const timings = try allocator.alloc(u64, config.repetitions);
+    defer allocator.free(timings);
+    var invalid = false;
+    for (timings, 0..) |*elapsed_ns, iteration| {
+        try common.checkInterrupted();
+        const sample = try runSample(std.heap.page_allocator, root, config, iteration);
+        const expected = .{
+            .iteration = iteration,
+            .origin_file = config.origin_file,
+            .origin_offset = config.origin_offset,
+            .file_index = config.target_file orelse config.origin_file,
+            .cursor_byte = config.target_offset orelse config.origin_offset,
+            .discovered_files = metadata.file_count,
+            .target_resident_before = metadata.expected_target_resident,
+            .target_visible_before = metadata.expected_target_visible,
+        };
+        var buffer: [std.meta.fields(@TypeOf(expected)).len + 2][]const u8 = undefined;
+        var errors = std.ArrayList([]const u8).initBuffer(&buffer);
+        inline for (std.meta.fields(@TypeOf(expected))) |field| {
+            const wanted = @field(expected, field.name);
+            const actual = @field(sample, field.name);
+            if (wanted != actual) {
+                errors.appendAssumeCapacity(try std.fmt.allocPrint(allocator, field.name ++ ": expected {any}, got {any}", .{ wanted, actual }));
+            }
+        }
+        if (sample.rendered_bytes == 0) errors.appendAssumeCapacity("invalid rendered_bytes");
+        if (sample.resident_files_before == 0) errors.appendAssumeCapacity("invalid resident_files_before");
+        try common.emit(output, SampleReport{
+            .scenario = metadata.scenario,
+            .sample = sample,
+            .validation_errors = errors.items,
+        });
+        invalid = invalid or errors.items.len != 0;
+        elapsed_ns.* = sample.elapsed_ns;
     }
-    try sink.json(.{ .type = "complete", .samples = config.repetitions });
+    try common.emit(output, .{ .type = "complete", .scenario = metadata.scenario, .samples = timings.len });
+    if (invalid) return error.InvalidSearchSample;
+    std.mem.sortUnstable(u64, timings, {}, std.sort.asc(u64));
+    const summary: Summary = .{
+        .scenario = metadata.scenario,
+        .sample_count = timings.len,
+        .median_ns = common.median(timings),
+        .p95_ns = common.p95(timings),
+        .min_ns = timings[0],
+        .max_ns = timings[timings.len - 1],
+        .outcome = if (config.target_file != null) "match" else "not_found",
+        .search_distance_bytes = metadata.search_distance_bytes,
+        .file_boundaries_before_match = metadata.file_boundaries_before_match,
+        .target_resident_before = metadata.expected_target_resident,
+    };
+    try common.emit(output, summary);
+    return summary;
 }
 
-fn runSample(allocator: std.mem.Allocator, root: []const u8, config: Config, iteration: usize, sink: anytype) !void {
+fn milliseconds(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
+}
+
+const Sample = struct {
+    type: []const u8 = "sample",
+    metric: []const u8 = "search_to_frame",
+    iteration: usize,
+    elapsed_ns: u64,
+    outcome: []const u8,
+    message: []const u8,
+    origin_file: usize,
+    origin_offset: usize,
+    file_index: ?usize,
+    cursor_byte: usize,
+    discovered_files: usize,
+    resident_files_before: usize,
+    target_resident_before: ?bool,
+    target_visible_before: ?bool,
+    rendered_bytes: usize,
+};
+
+const SampleReport = struct {
+    scenario: []const u8,
+    sample: Sample,
+    validation_errors: []const []const u8,
+
+    pub fn jsonStringify(self: SampleReport, json: *std.json.Stringify) !void {
+        try json.beginObject();
+        try common.jsonFields(json, self.sample);
+        try common.jsonFields(json, .{
+            .scenario = self.scenario,
+            .valid = self.validation_errors.len == 0,
+            .validation_errors = self.validation_errors,
+        });
+        try json.endObject();
+    }
+};
+
+fn runSample(allocator: std.mem.Allocator, root: []const u8, config: Config, iteration: usize) !Sample {
     // Discovery, loading the origin, positioning, and prompt entry are setup.
     // Every sample starts with a fresh application workspace, not a cold OS cache.
     var workspace = try content.Workspace.open(allocator, root, null);
@@ -113,6 +253,7 @@ fn runSample(allocator: std.mem.Allocator, root: []const u8, config: Config, ite
     var setup_timer = try std.time.Timer.start();
     var initial_frame = try editor.renderFrame(.{ .rows = config.rows, .cols = config.cols });
     while (workspace.hasPendingRequest()) {
+        try common.checkInterrupted();
         if (setup_timer.read() > 30 * std.time.ns_per_s) return error.SetupTimeout;
         _ = try editor.handle(.tick);
         if (!workspace.hasPendingRequest()) initial_frame = try editor.renderFrame(.{ .rows = config.rows, .cols = config.cols });
@@ -139,6 +280,7 @@ fn runSample(allocator: std.mem.Allocator, root: []const u8, config: Config, ite
     var timer = try std.time.Timer.start();
     _ = try editor.handle(.{ .byte = '\r' });
     while (editor.search_job != null or editor.search_next != null) {
+        try common.checkInterrupted();
         if (timer.read() > 30 * std.time.ns_per_s) return error.SearchTimeout;
         _ = try editor.handle(.tick);
         // Service the real mailbox as soon as the worker requests it. Terminal
@@ -164,13 +306,11 @@ fn runSample(allocator: std.mem.Allocator, root: []const u8, config: Config, ite
     } else if (editor.current_file != config.origin_file or editor.document.buffer.cursor != config.origin_offset) {
         return error.MissMovedCursor;
     }
-    try sink.json(.{
-        .type = "sample",
-        .metric = "search_to_frame",
+    return .{
         .iteration = iteration,
         .elapsed_ns = elapsed_ns,
         .outcome = @as([]const u8, if (config.target_file != null) "match" else "not_found"),
-        .message = message,
+        .message = config.expected_message,
         .origin_file = config.origin_file,
         .origin_offset = config.origin_offset,
         .file_index = editor.current_file,
@@ -180,41 +320,8 @@ fn runSample(allocator: std.mem.Allocator, root: []const u8, config: Config, ite
         .target_resident_before = target_resident_before,
         .target_visible_before = target_visible_before,
         .rendered_bytes = frame.len,
-    });
+    };
 }
-
-const Output = struct {
-    allocator: std.mem.Allocator,
-    file: std.fs.File,
-
-    fn json(self: *Output, value: anytype) !void {
-        const serialized = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
-        defer self.allocator.free(serialized);
-        try self.file.writeAll(serialized);
-        try self.file.writeAll("\n");
-    }
-};
-
-const TestSink = struct {
-    samples: usize = 0,
-    complete: bool = false,
-    resident: ?bool = null,
-    visible: ?bool = null,
-
-    fn json(self: *TestSink, value: anytype) !void {
-        if (comptime @hasField(@TypeOf(value), "metric")) {
-            try std.testing.expect(value.rendered_bytes > 0);
-            try std.testing.expectEqual(self.samples, value.iteration);
-            self.samples += 1;
-            self.resident = value.target_resident_before;
-            self.visible = value.target_visible_before;
-        }
-        if (comptime @hasField(@TypeOf(value), "samples")) {
-            try std.testing.expectEqual(self.samples, value.samples);
-            self.complete = true;
-        }
-    }
-};
 
 test "search samples validate next match, wrap, and full-pass miss" {
     const allocator = std.testing.allocator;
@@ -232,31 +339,30 @@ test "search samples validate next match, wrap, and full-pass miss" {
         .target_offset = 9,
         .expected_message = "Match",
     };
-    var next: TestSink = .{};
-    try runSearch(allocator, root, config, &next);
-    try std.testing.expect(next.complete);
-    try std.testing.expectEqual(@as(?bool, true), next.resident);
-    try std.testing.expectEqual(@as(?bool, true), next.visible);
+    for (0..config.repetitions) |iteration| {
+        const next = try runSample(allocator, root, config, iteration);
+        try std.testing.expectEqual(iteration, next.iteration);
+        try std.testing.expectEqual(@as(?bool, true), next.target_resident_before);
+        try std.testing.expectEqual(@as(?bool, true), next.target_visible_before);
+    }
+    config.target_offset = 10;
+    try std.testing.expectError(error.UnexpectedSearchDestination, runSample(allocator, root, config, 0));
     config.origin_offset = 9;
     config.target_offset = 0;
     config.expected_message = "Search wrapped";
-    var wrapped: TestSink = .{};
-    try runSearch(allocator, root, config, &wrapped);
-    try std.testing.expect(wrapped.complete);
+    const wrapped = try runSample(allocator, root, config, 0);
+    try std.testing.expectEqual(@as(usize, 0), wrapped.cursor_byte);
     config.query = "missing";
     config.target_file = null;
     config.target_offset = null;
     config.expected_message = "Pattern not found";
-    var missing: TestSink = .{};
-    try runSearch(allocator, root, config, &missing);
-    try std.testing.expect(missing.complete);
-    try std.testing.expectEqual(@as(?bool, null), missing.resident);
+    const missing = try runSample(allocator, root, config, 0);
+    try std.testing.expectEqual(@as(usize, 9), missing.cursor_byte);
+    try std.testing.expectEqual(@as(?bool, null), missing.target_resident_before);
     config.target_file = 0;
     config.target_offset = 0;
     config.expected_message = "Match";
-    var invalid: TestSink = .{};
-    try std.testing.expectError(error.UnexpectedSearchMessage, runSearch(allocator, root, config, &invalid));
-    try std.testing.expectEqual(@as(usize, 0), invalid.samples);
+    try std.testing.expectError(error.UnexpectedSearchMessage, runSample(allocator, root, config, 0));
 }
 
 test "fresh repetitions preserve target residency and input bytes" {
@@ -278,19 +384,69 @@ test "fresh repetitions preserve target residency and input bytes" {
         .target_offset = 2,
         .expected_message = "Match",
     };
-    var unloaded: TestSink = .{};
-    try runSearch(allocator, root, config, &unloaded);
-    try std.testing.expectEqual(@as(?bool, false), unloaded.resident);
-    try std.testing.expectEqual(@as(?bool, false), unloaded.visible);
-    config.preload_target = true;
-    var resident: TestSink = .{};
-    try runSearch(allocator, root, config, &resident);
-    try std.testing.expectEqual(@as(?bool, true), resident.resident);
-    try std.testing.expectEqual(@as(?bool, false), resident.visible);
+    for ([_]bool{ false, true }) |preload| {
+        config.preload_target = preload;
+        for (0..config.repetitions) |iteration| {
+            const sample = try runSample(allocator, root, config, iteration);
+            try std.testing.expectEqual(@as(?bool, preload), sample.target_resident_before);
+            try std.testing.expectEqual(@as(?bool, false), sample.target_visible_before);
+        }
+    }
     const actual_origin = try temp.dir.readFileAlloc(allocator, "a", 1024);
     defer allocator.free(actual_origin);
     const actual_target = try temp.dir.readFileAlloc(allocator, "b", 1024);
     defer allocator.free(actual_target);
     try std.testing.expectEqualStrings(origin, actual_origin);
     try std.testing.expectEqualStrings(target, actual_target);
+}
+
+test "search samples reject a match with incomplete coverage" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a", .data = "origin\nx\nx\nx\nx\nx\nx\nx\n" });
+    const oversized = try temp.dir.createFile("b", .{});
+    defer oversized.close();
+    try oversized.setEndPos(content.max_file_size + 1);
+    try temp.dir.writeFile(.{ .sub_path = "c", .data = "x\nneedle\nx\nx\nx\nx\nx\nx\n" });
+    const root = try temp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    try std.testing.expectError(error.UnexpectedSearchMessage, runSample(allocator, root, .{
+        .repetitions = 1,
+        .rows = 6,
+        .cols = 40,
+        .target_file = 2,
+        .target_offset = 2,
+        .query = "needle",
+        .expected_message = "Match",
+    }, 0));
+    try std.testing.expectEqual(content.max_file_size + 1, try oversized.getEndPos());
+}
+
+test "search reports validated samples and suppresses summaries for invalid residency" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try temp.dir.realpathAlloc(allocator, ".");
+    var metadata = try fixtures.generate(allocator, temp.dir, .{
+        .name = "test/unloaded",
+        .files = &.{ .{ .byte_count = 8192 }, .{ .byte_count = 8192, .needle_offset = 65 } },
+        .target_file = 1,
+    }, 2);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    const summary = try runScenario(allocator, root, metadata, &output.writer);
+    try std.testing.expectEqual(@as(usize, 2), summary.sample_count);
+    try std.testing.expect(summary.median_ns >= @as(f64, @floatFromInt(summary.min_ns)));
+    try std.testing.expect(summary.median_ns <= @as(f64, @floatFromInt(summary.p95_ns)));
+    try std.testing.expect(summary.p95_ns <= summary.max_ns);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output.written(), "\"valid\":true"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output.written(), "\"target_resident_before\":false,\"target_visible_before\":false"));
+
+    metadata.expected_target_resident = true;
+    output.clearRetainingCapacity();
+    try std.testing.expectError(error.InvalidSearchSample, runScenario(allocator, root, metadata, &output.writer));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output.written(), "\"valid\":false"));
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"type\":\"summary\"") == null);
 }
