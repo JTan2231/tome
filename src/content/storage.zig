@@ -1,6 +1,7 @@
 const std = @import("std");
 const Buffer = @import("buffer.zig").Buffer;
 const History = @import("history.zig").History;
+const HighlightCache = @import("highlight/root.zig").Cache;
 
 /// A simple in-memory editor deliberately limits the amount read at once.
 pub const max_file_size = 64 * 1024 * 1024;
@@ -10,6 +11,7 @@ pub const Document = struct {
     path: []u8,
     buffer: Buffer,
     history: History = .{},
+    highlights: HighlightCache = .{},
     is_new: bool,
     saved_stat: ?std.fs.File.Stat,
 
@@ -64,6 +66,7 @@ pub const Document = struct {
     }
 
     pub fn deinit(self: *Document) void {
+        self.highlights.clear();
         self.history.deinit(self.allocator);
         self.buffer.deinit(self.allocator);
         self.allocator.free(self.path);

@@ -319,7 +319,7 @@ pub const Workspace = struct {
                 const document = entry.document.?;
                 if (entry.dirty or document.is_new or document.history.items.items.len != 0) continue;
                 count += 1;
-                bytes += document.buffer.bytes.capacity;
+                bytes += document.buffer.bytes.capacity + document.highlights.byteSize();
                 if (index == requested or self.active_index == index or
                     std.mem.indexOfScalar(usize, self.viewport.items, index) != null) continue;
                 if (oldest == null or entry.last_used < self.entries.items[oldest.?].last_used) oldest = index;

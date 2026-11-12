@@ -147,10 +147,18 @@ and existing 64 MiB file limit apply to search too.
 
 ## Behavior and limits
 
+- Zig (`.zig`, `.zon`) and C (`.c`, `.h`) get syntax colors from built-in
+  scanners. Highlighting reads the current buffer, including unsaved edits,
+  and runs in the background. The editor draws plain text while colors for the
+  current revision are pending. Highlighting is limited to buffers up to 1 MiB
+  and 65,536 colored ranges per file. No language tools are needed at runtime.
+  The default palette is compiled from `src/syntax_theme.json` using the ANSI
+  color subset of Tree-sitter's theme format.
 - Vertical and horizontal scrolling follow the cursor; lines do not wrap.
 - Discovery records file paths, without reading every file into a buffer. Contents
-  load as they approach the viewport. Clean buffers use a cache limited to eight
-  files or 8 MiB, with the active, currently requested, and visible files protected.
+  load as they approach the viewport. Clean buffers and their syntax ranges use
+  a cache limited to eight files or 8 MiB, with the active, currently requested,
+  and visible files protected.
   A viewport spanning many or large files can exceed this budget. Unsaved
   buffers and files with undo history stay in memory for the session, so their
   size can exceed this cache budget. Undo keeps a full buffer snapshot per step;

@@ -1,0 +1,10 @@
+{
+  "theme": {
+    "keyword": 5,
+    "comment": 8,
+    "string": 2,
+    "number": 3,
+    "function.builtin": 6,
+    "keyword.directive": 12
+  }
+}

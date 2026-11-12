@@ -6,6 +6,8 @@ const Workspace = content.Workspace;
 const Stream = @import("stream.zig").Stream;
 const Row = @import("stream.zig").Row;
 const search = content.search;
+const highlight = content.highlight;
+const syntax_theme = @import("syntax_theme.zig");
 
 const Mode = enum { normal, insert, visual, visual_line };
 const Operator = enum { yank, delete, change };
@@ -40,6 +42,8 @@ pub const Editor = struct {
     search_next: ?search.Options = null,
     search_accept: bool = false,
     document_revision: u64 = 0,
+    highlight_enabled: bool = false,
+    highlight_job: ?*highlight.Job = null,
     background_redraw: bool = false,
     search_projection: ?search.Projection = null,
     projection_document: ?*content.Document = null,
@@ -90,6 +94,7 @@ pub const Editor = struct {
     }
 
     pub fn deinit(self: *Editor) void {
+        if (self.highlight_job) |job| job.deinit();
         if (self.search_job) |job| job.deinit();
         self.clearProjection();
         self.search_text.deinit(self.allocator);
@@ -105,12 +110,13 @@ pub const Editor = struct {
 
     pub fn run(self: *Editor, tty: *terminal.Terminal) !void {
         if (self.stream) |*stream| stream.async_load = true;
+        self.highlight_enabled = true;
         var size = tty.size();
         try self.draw(tty, size);
         while (true) {
             const timeout_ms: i32 = if (self.search_job != null or self.search_next != null)
                 1
-            else if (self.workspace != null and self.workspace.?.hasPendingRequest())
+            else if (self.highlight_job != null or (self.workspace != null and self.workspace.?.hasPendingRequest()))
                 8
             else
                 100;
@@ -611,6 +617,7 @@ pub const Editor = struct {
 
     fn changed(self: *Editor) void {
         self.clearProjection();
+        self.document.highlights.clear();
         self.document_revision +%= 1;
         self.dirty = true;
         if (self.current_file) |index| {
@@ -790,6 +797,58 @@ pub const Editor = struct {
                 self.search_accept = true;
             }
         }
+        self.pollHighlights();
+    }
+
+    const HighlightSource = struct {
+        document: *content.Document,
+        revision: u64,
+        filename: []const u8,
+    };
+
+    fn highlightSource(self: *const Editor, file: usize) ?HighlightSource {
+        if (self.workspace) |workspace| {
+            const entry = &workspace.entries.items[file];
+            return .{ .document = entry.document orelse return null, .revision = entry.revision, .filename = entry.name };
+        }
+        return .{ .document = self.document, .revision = self.document_revision, .filename = self.filename };
+    }
+
+    fn startHighlight(self: *Editor, file: usize) bool {
+        const source = self.highlightSource(file) orelse return false;
+        const cache = &source.document.highlights;
+        if (cache.revision == source.revision) return false;
+        const language = highlight.Language.detect(source.filename) orelse return false;
+        const bytes = source.document.buffer.bytes.items;
+        if (bytes.len == 0 or bytes.len > highlight.max_source_bytes) return false;
+        self.highlight_job = highlight.Job.start(file, source.revision, language, bytes) catch {
+            // Highlighting is optional. Retry only after the text changes.
+            cache.clear();
+            cache.revision = source.revision;
+            return false;
+        };
+        return true;
+    }
+
+    fn pollHighlights(self: *Editor) void {
+        if (!self.highlight_enabled) return;
+        if (self.highlight_job) |job| {
+            const source = self.highlightSource(job.file);
+            const current = source != null and source.?.revision == job.revision;
+            if (!current) job.cancel();
+            if (!job.isDone()) return;
+            if (current and job.publish(&source.?.document.highlights)) self.background_redraw = true;
+            self.highlight_job = null;
+            job.deinit();
+        }
+        // A bracketed paste is one input operation, regardless of its size.
+        if (self.pasting) return;
+        if (self.workspace) |workspace| {
+            if (self.current_file) |file| if (self.startHighlight(file)) return;
+            for (workspace.viewport.items) |file| {
+                if (file != self.current_file and self.startHighlight(file)) return;
+            }
+        } else _ = self.startHighlight(0);
     }
 
     fn acceptMatch(self: *Editor, found: *search.Match) !void {
@@ -953,6 +1012,9 @@ pub const Editor = struct {
 
     fn draw(self: *Editor, tty: *terminal.Terminal, size: terminal.Size) !void {
         try tty.writeAll(try self.renderFrame(size));
+        // Newly visible files can be queued now. Publish results before a
+        // frame, so a ready result always gets a redraw on the same tick.
+        if (self.highlight_job == null) self.pollHighlights();
     }
 
     /// Prepare the same complete frame used by the terminal loop, without I/O.
@@ -1000,7 +1062,10 @@ pub const Editor = struct {
                     rendered.end = end;
                     if (self.workspace == null or line.file == self.current_file) {
                         try self.drawLine(start, end, size.cols);
-                    } else try self.drawText(document.buffer.bytes.items[start..end], self.left_column, size.cols);
+                    } else {
+                        const spans = document.highlights.get(self.workspace.?.entries.items[line.file].revision);
+                        try self.drawStyledTextFrom(document.buffer.bytes.items[start..end], self.left_column, size.cols, null, start, 0, spans);
+                    }
                 }
                 // Do not prefetch a file below the last visible row.
                 if (row + 1 < self.height) visible = try self.stepRow(rendered, true);
@@ -1076,6 +1141,7 @@ pub const Editor = struct {
     fn drawLine(self: *Editor, start: usize, end: usize, width: usize) !void {
         const bytes = self.document.buffer.bytes.items[start..end];
         const selected = self.selection();
+        const spans = self.document.highlights.get(self.currentRevision());
         const projection = if (self.search_projection != null and self.search_projection.?.line_start == start) self.search_projection else null;
         if (projection) |prepared| {
             var low: usize = 0;
@@ -1085,8 +1151,8 @@ pub const Editor = struct {
                 if (prepared.anchors[middle].column <= self.left_column) low = middle else high = middle;
             }
             const anchor = prepared.anchors[low];
-            try self.drawStyledTextFrom(self.document.buffer.bytes.items[anchor.offset..end], self.left_column, width, selected, anchor.offset, anchor.column);
-        } else try self.drawStyledText(bytes, self.left_column, width, selected, start);
+            try self.drawStyledTextFrom(self.document.buffer.bytes.items[anchor.offset..end], self.left_column, width, selected, anchor.offset, anchor.column, spans);
+        } else try self.drawStyledTextFrom(bytes, self.left_column, width, selected, start, 0, spans);
         if (selected) |range| {
             const column = if (projection) |prepared| prepared.total_columns else display.columns(bytes);
             const line_selected = range.linewise and start >= range.start and
@@ -1104,27 +1170,36 @@ pub const Editor = struct {
     }
 
     fn drawText(self: *Editor, bytes: []const u8, left: usize, width: usize) !void {
-        try self.drawStyledText(bytes, left, width, null, 0);
+        try self.drawStyledTextFrom(bytes, left, width, null, 0, 0, &.{});
     }
 
-    fn drawStyledText(self: *Editor, bytes: []const u8, left: usize, width: usize, selected: ?Range, offset: usize) !void {
-        return self.drawStyledTextFrom(bytes, left, width, selected, offset, 0);
+    fn spanBefore(offset: usize, span: highlight.Span) bool {
+        return span.end <= offset;
     }
 
-    fn drawStyledTextFrom(self: *Editor, bytes: []const u8, left: usize, width: usize, selected: ?Range, offset: usize, initial_column: usize) !void {
+    fn drawStyledTextFrom(self: *Editor, bytes: []const u8, left: usize, width: usize, selected: ?Range, offset: usize, initial_column: usize, spans: []const highlight.Span) !void {
         var index: usize = 0;
         var column: usize = initial_column;
         var visible_base = false;
         var highlighted = false;
+        var kind: ?highlight.Kind = null;
+        var span_index = std.sort.partitionPoint(highlight.Span, spans, offset, spanBefore);
         while (index < bytes.len) {
             const unit = display.cell(bytes[index..], column);
             const end = column + unit.width;
             if (column >= left + width) break;
             if ((unit.width == 0 and visible_base) or (unit.width != 0 and end > left)) {
-                const highlight = if (selected) |range| offset + index >= range.start and offset + index < range.end else false;
-                if (highlight != highlighted) {
-                    try self.append(if (highlight) "\x1b[7m" else "\x1b[27m");
-                    highlighted = highlight;
+                const position = offset + index;
+                const in_selection = if (selected) |range| position >= range.start and position < range.end else false;
+                if (in_selection != highlighted) {
+                    try self.append(if (in_selection) "\x1b[7m" else "\x1b[27m");
+                    highlighted = in_selection;
+                }
+                while (span_index < spans.len and spans[span_index].end <= position) span_index += 1;
+                const next_kind = if (span_index < spans.len and spans[span_index].start <= position) spans[span_index].kind else null;
+                if (next_kind != kind) {
+                    try self.append(syntax_theme.foreground(next_kind));
+                    kind = next_kind;
                 }
             }
             if (unit.width == 0) {
@@ -1147,6 +1222,7 @@ pub const Editor = struct {
             column = end;
             index += unit.len;
         }
+        if (kind != null) try self.append(syntax_theme.foreground(null));
         if (highlighted) try self.append("\x1b[27m");
     }
 };
@@ -1840,6 +1916,52 @@ test "asynchronous rendering leaves pending documents to the loader" {
     _ = try editor.handle(.tick);
     const frame = try editor.renderFrame(.{ .rows = 5, .cols = 40 });
     try std.testing.expect(std.mem.indexOf(u8, frame, "neighbor") != null);
+}
+
+test "syntax highlighting drops stale work and colors each visible file" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(.{ .sub_path = "a.zig", .data = "const n = 42;" });
+    try temp.dir.writeFile(.{ .sub_path = "b.c", .data = "int n;" });
+    const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    var workspace = try Workspace.open(std.testing.allocator, root, null);
+    defer workspace.deinit();
+    var editor = try Editor.initWorkspace(std.testing.allocator, &workspace);
+    defer editor.deinit();
+    _ = try workspace.ensure(1);
+    editor.stream.?.async_load = true;
+    editor.highlight_enabled = true;
+    const size: terminal.Size = .{ .rows = 6, .cols = 40 };
+    const comment_color = syntax_theme.foreground(.comment);
+    const keyword_color = syntax_theme.foreground(.keyword);
+    _ = try editor.renderFrame(size);
+    editor.pollHighlights();
+    try waitForHighlight(&editor);
+
+    // Finish an edit after the worker has produced a result, but before the
+    // editor has a chance to publish it. The next request must see unsaved text.
+    try typeKeys(&editor, "i// \x1b0v");
+    _ = try editor.handle(.tick);
+    try std.testing.expectEqual(@as(?u64, null), editor.document.highlights.revision);
+    try waitForHighlight(&editor);
+    const pending = try editor.renderFrame(size);
+    var expected: [128]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, pending, try std.fmt.bufPrint(&expected, "{s}/", .{comment_color})) == null);
+    _ = try editor.handle(.tick);
+    try waitForHighlight(&editor);
+    _ = try editor.handle(.tick);
+
+    const frame = try editor.renderFrame(size);
+    try std.testing.expect(std.mem.indexOf(u8, frame, try std.fmt.bufPrint(&expected, "\x1b[7m{s}/\x1b[27m/ const n = 42;\x1b[39m", .{comment_color})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, try std.fmt.bufPrint(&expected, "{s}int\x1b[39m n;", .{keyword_color})) != null);
+}
+
+fn waitForHighlight(editor: *const Editor) !void {
+    const job = editor.highlight_job orelse return error.NoHighlightJob;
+    var timer = try std.time.Timer.start();
+    while (!job.isDone() and timer.read() < std.time.ns_per_s) std.Thread.sleep(100 * std.time.ns_per_us);
+    try std.testing.expect(job.isDone());
 }
 
 test "long-line search retains correct display anchors across redraw and resize" {

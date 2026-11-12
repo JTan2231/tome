@@ -6,6 +6,7 @@ pub const max_file_size = @import("storage.zig").max_file_size;
 pub const cache_file_limit = @import("workspace.zig").cache_file_limit;
 pub const cache_byte_limit = @import("workspace.zig").cache_byte_limit;
 pub const search = @import("search.zig");
+pub const highlight = @import("highlight/root.zig");
 
 test {
     _ = @import("buffer.zig");
@@ -13,4 +14,5 @@ test {
     _ = @import("storage.zig");
     _ = @import("workspace.zig");
     _ = @import("search.zig");
+    _ = highlight;
 }
