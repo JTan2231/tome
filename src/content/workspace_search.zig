@@ -1,4 +1,5 @@
 const std = @import("std");
+const files = @import("files.zig");
 const search = @import("search.zig");
 const storage = @import("storage.zig");
 const Entry = @import("workspace.zig").Entry;
@@ -173,8 +174,7 @@ pub const Job = struct {
             },
             .disk => |disk| {
                 // A cataloged regular file can be replaced while the editor is open.
-                const fd = try std.posix.open(disk.path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOFOLLOW = true }, 0);
-                const file = std.fs.File{ .handle = fd };
+                const file = try files.openReadNoFollow(std.fs.cwd(), disk.path);
                 defer file.close();
                 const stat = try file.stat();
                 if (stat.kind != .file or stat.size > storage.max_file_size) return;

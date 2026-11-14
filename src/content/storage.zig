@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const files = @import("files.zig");
 const Buffer = @import("buffer.zig").Buffer;
 const History = @import("history.zig").History;
 const HighlightCache = @import("highlight/root.zig").Cache;
@@ -90,7 +92,9 @@ pub const Document = struct {
         const file = atomic.file_writer.file;
         try file.writeAll(self.buffer.bytes.items);
         // chmod after creation avoids the umask stripping existing permission bits.
-        if (self.saved_stat) |stat| try file.chmod(stat.mode & 0o777);
+        if (builtin.os.tag != .windows) {
+            if (self.saved_stat) |stat| try file.chmod(stat.mode & 0o777);
+        }
         try file.sync();
         try self.checkUnchanged();
         try atomic.finish();
@@ -113,11 +117,10 @@ pub const Document = struct {
 fn statOrMissing(path: []const u8) !?std.fs.File.Stat {
     // The stored path was resolved on open. Refuse a new symlink introduced
     // afterwards rather than replacing that link on save.
-    const stat = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
+    return files.statNoFollow(path) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    return std.fs.File.Stat.fromPosix(stat);
 }
 
 fn sameVersion(a: std.fs.File.Stat, b: std.fs.File.Stat) bool {
@@ -180,9 +183,12 @@ test "save follows existing symlink and retains target permission bits" {
     defer temp.cleanup();
     const target = try temp.dir.createFile("target", .{ .mode = 0o640 });
     try target.writeAll("original\r\n");
-    try target.chmod(0o640);
+    if (builtin.os.tag != .windows) try target.chmod(0o640);
     target.close();
-    try temp.dir.symLink("target", "link", .{});
+    temp.dir.symLink("target", "link", .{}) catch |err| {
+        if (builtin.os.tag == .windows and err == error.AccessDenied) return error.SkipZigTest;
+        return err;
+    };
     const path = try tempPath(std.testing.allocator, temp.dir, "link");
     defer std.testing.allocator.free(path);
     var doc = try Document.open(std.testing.allocator, path);
@@ -195,8 +201,10 @@ test "save follows existing symlink and retains target permission bits" {
     const bytes = try temp.dir.readFileAlloc(std.testing.allocator, "target", 1024);
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("new original\r\n", bytes);
-    const stat = try temp.dir.statFile("target");
-    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o640), stat.mode & 0o777);
+    if (builtin.os.tag != .windows) {
+        const stat = try temp.dir.statFile("target");
+        try std.testing.expectEqual(@as(std.fs.File.Mode, 0o640), stat.mode & 0o777);
+    }
 }
 
 test "nonregular files and dangling symlinks are rejected" {
@@ -205,7 +213,10 @@ test "nonregular files and dangling symlinks are rejected" {
     const directory = try tempPath(std.testing.allocator, temp.dir, ".");
     defer std.testing.allocator.free(directory);
     try std.testing.expectError(error.NotRegularFile, Document.open(std.testing.allocator, directory));
-    try temp.dir.symLink("absent", "dangling", .{});
+    temp.dir.symLink("absent", "dangling", .{}) catch |err| {
+        if (builtin.os.tag == .windows and err == error.AccessDenied) return;
+        return err;
+    };
     const link = try tempPath(std.testing.allocator, temp.dir, "dangling");
     defer std.testing.allocator.free(link);
     try std.testing.expectError(error.DanglingSymlink, Document.open(std.testing.allocator, link));

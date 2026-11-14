@@ -1,25 +1,26 @@
 # Terminal and display
 
 Tome reads keys and text from the terminal and draws the editor view. It saves
-the terminal settings for restoration when the session ends. Tome uses escape
-sequences that target Ghostty and supports keyboard input. It ignores mouse
-reports. [Ghostty VT reference](https://ghostty.org/docs/vt/reference)
+the terminal settings for restoration when the session ends. Tome uses virtual
+terminal escape sequences and supports keyboard input. It ignores mouse reports.
+[Ghostty VT reference](https://ghostty.org/docs/vt/reference)
 
 ## Open and restore the terminal
 
 Connect standard input and standard output to a terminal before starting the
 interactive editor. If either is missing, Tome reports `tome: NotATerminal`
 and exits with status 1. Run Tome from a terminal to start an interactive
-session.
+session. On Windows, use Windows Terminal or a console host that supports
+[virtual terminal sequences](https://learn.microsoft.com/en-us/windows/console/console-virtual-terminal-sequences).
 
 At startup, Tome switches the terminal to raw mode, opens the alternate
 screen, and enables bracketed paste. It translates terminal key sequences and
 UTF-8 keyboard input into editor events. [Edit text](editing.md)
 
 Tome attempts to restore terminal settings and leave the alternate screen
-after normal exit, an I/O error, or a handled signal. Tome handles `SIGHUP`,
-`SIGINT`, `SIGQUIT`, and `SIGTERM`. When Tome exits after an I/O error or a
-handled signal, it discards unsaved edits.
+after normal exit, an I/O error, or a handled interruption. On macOS and Linux,
+Tome handles `SIGHUP`, `SIGINT`, `SIGQUIT`, and `SIGTERM`. On Windows, it handles
+`Ctrl+Break`. An I/O error or handled interruption discards unsaved edits.
 
 Tome ignores `Ctrl+C` and `Ctrl+Z` as keystrokes. To close the editor from
 normal mode, use a quit command. [Save and recovery](workspace.md#save-and-recovery)

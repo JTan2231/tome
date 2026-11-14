@@ -2,6 +2,7 @@
 //! supplies small copies of resident text through a nonblocking mailbox.
 //! Neither scanning nor destination preparation touches the workspace cache.
 const std = @import("std");
+const openReadNoFollow = @import("files.zig").openReadNoFollow;
 const storage = @import("storage.zig");
 
 pub const chunk_size = 64 * 1024;
@@ -288,8 +289,7 @@ pub const Job = struct {
         try self.checkCancelled();
         // Nonblocking/no-follow open prevents a replaced catalog entry (FIFO or
         // symlink) from turning a regular-file search into an unbounded wait.
-        const fd = try std.posix.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOFOLLOW = true }, 0);
-        const file = std.fs.File{ .handle = fd };
+        const file = try openReadNoFollow(std.fs.cwd(), path);
         defer file.close();
         const before = try file.stat();
         if (before.kind != .file) return error.NotRegularFile;

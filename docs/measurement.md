@@ -5,6 +5,9 @@ the editor's content and frame code. The measurements record elapsed time
 without a terminal. Run the commands from the checkout with the pinned Zig
 version. [Set up Zig](installation.md)
 
+The single-file measurement runs on Windows, macOS, and Linux. The benchmark
+commands require macOS or Linux.
+
 ## Choose a measurement
 
 | Command | Measurement |

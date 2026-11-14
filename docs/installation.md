@@ -1,10 +1,24 @@
 # Install and run Tome
 
-Tome builds on macOS and Linux. The macOS build uses the system's `libSystem`.
-Tome has no third-party runtime libraries.
+Tome builds on Windows, macOS, and Linux. The macOS build uses the system's
+`libSystem`. Tome has no third-party runtime libraries.
 
 Build from the checkout with [Zig `0.15.2`](../.zigversion). To open the editor,
 use a [compatible terminal](terminal.md#open-and-restore-the-terminal).
+
+## Install on Windows
+
+Open Windows PowerShell 5.1 or PowerShell 7 in the checkout.
+
+1. Run `.\install.ps1`. The script uses the version of Zig pinned in
+   `.zigversion`. If that version is missing from `PATH`, the script downloads
+   and verifies the official Windows archive and caches Zig under
+   `%LOCALAPPDATA%\Programs\Tome\tools`.
+2. Check that `Get-Command tome` points to
+   `%LOCALAPPDATA%\Programs\Tome\bin\tome.exe`. The script builds in
+   `ReleaseSafe` mode and adds the install directory to `PATH` for your user
+   and the PowerShell session that ran the script.
+3. Run `tome` from Windows Terminal to open the editor.
 
 ## Set up Zig on macOS
 
@@ -25,7 +39,7 @@ These steps require Homebrew.
 3. Run `zig version`. If it does not print `0.15.2`, correct `PATH` before
    building Tome.
 
-## Install the editor
+## Install on macOS or Linux
 
 Start in the checkout with Zig on `PATH`.
 
@@ -47,9 +61,11 @@ Start in the checkout with Zig on `PATH`.
 Start in the checkout with Zig on `PATH`.
 
 1. Run `zig build`. Check that `zig-out/bin` contains `tome` and `tome-measure`.
-   Use `zig build -Doptimize=ReleaseSafe` for a release build.
+   On Windows, the executables end in `.exe`. Use
+   `zig build -Doptimize=ReleaseSafe` for a release build.
 2. Run `./zig-out/bin/tome` to browse the checkout, or pass a path as described
-   under [Open a workspace](#open-a-workspace).
+   under [Open a workspace](#open-a-workspace). On Windows, run
+   `.\zig-out\bin\tome.exe`.
 
 To build and open a file in one command, run `zig build run -- notes.txt`.
 See [Performance measurement](measurement.md) for the measurement commands.

@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const files = @import("files.zig");
 const IgnoreRules = @import("gitignore.zig").Rules;
 const storage = @import("storage.zig");
 const Loader = @import("loader.zig").Job;
@@ -24,8 +26,7 @@ pub const Entry = struct {
     pub fn isBrowsable(self: *const Entry) bool {
         if (self.document != null) return true;
         if (self.load_error != null) return false;
-        const fd = std.posix.open(self.path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOFOLLOW = true }, 0) catch return false;
-        const file = std.fs.File{ .handle = fd };
+        const file = files.openReadNoFollow(std.fs.cwd(), self.path) catch return false;
         defer file.close();
         const stat = file.stat() catch return false;
         return stat.kind == .file and stat.size <= storage.max_file_size;
@@ -142,12 +143,20 @@ pub const Workspace = struct {
             }
         }.lessThan);
         for (children.items) |child| {
-            const relative = try std.fs.path.join(self.allocator, &.{ prefix, child.name });
+            const relative = if (prefix.len == 0)
+                try self.allocator.dupe(u8, child.name)
+            else
+                try std.mem.join(self.allocator, "/", &.{ prefix, child.name });
             defer self.allocator.free(relative);
             if (IgnoreRules.excludes(rules, child.name, relative, child.directory)) continue;
             if (child.directory) {
                 var nested = dir.openDir(child.name, .{ .iterate = true, .no_follow = true }) catch continue;
                 defer nested.close();
+                if (builtin.os.tag == .windows) {
+                    // Directory enumeration can report junctions as directories.
+                    const stat = nested.stat() catch continue;
+                    if (stat.kind != .directory) continue;
+                }
                 self.discover(nested, relative, rules) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => continue,
@@ -155,6 +164,7 @@ pub const Workspace = struct {
             } else {
                 const absolute = try std.fs.path.join(self.allocator, &.{ self.root, relative });
                 defer self.allocator.free(absolute);
+                if (builtin.os.tag == .windows) std.mem.replaceScalar(u8, absolute, '/', '\\');
                 try self.append(relative, absolute);
             }
         }
@@ -163,6 +173,7 @@ pub const Workspace = struct {
     fn append(self: *Workspace, name: []const u8, path: []const u8) !void {
         const owned_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned_name);
+        if (builtin.os.tag == .windows) std.mem.replaceScalar(u8, owned_name, '\\', '/');
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned_path);
         try self.entries.append(self.allocator, .{ .name = owned_name, .path = owned_path });
@@ -529,7 +540,9 @@ test "catalog orders containers first recursively without reading file contents"
     try temp.dir.makePath(".git");
     for ([_][]const u8{ "z/deep/x", "z/a", "a/z", "a/a", "a.txt", ".hidden", ".git/ignored" }) |path|
         try temp.dir.writeFile(.{ .sub_path = path, .data = "content" });
-    try temp.dir.symLink(".", "loop", .{ .is_directory = true });
+    temp.dir.symLink(".", "loop", .{ .is_directory = true }) catch |err| {
+        if (builtin.os.tag != .windows or err != error.AccessDenied) return err;
+    };
     const root = try temp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root);
     var workspace = try Workspace.open(std.testing.allocator, root, null);
@@ -769,7 +782,10 @@ test "empty directory stays empty and explicit symlink reuses its target" {
     try std.testing.expectEqual(@as(usize, 0), empty.entries.items.len);
     try std.testing.expect(!empty.hasChanges());
     try temp.dir.writeFile(.{ .sub_path = "target", .data = "contents" });
-    try temp.dir.symLink("target", "link", .{});
+    temp.dir.symLink("target", "link", .{}) catch |err| {
+        if (builtin.os.tag == .windows and err == error.AccessDenied) return;
+        return err;
+    };
     const link = try std.fs.path.join(std.testing.allocator, &.{ root, "link" });
     defer std.testing.allocator.free(link);
     var workspace = try Workspace.open(std.testing.allocator, root, link);

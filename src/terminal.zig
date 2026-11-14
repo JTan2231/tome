@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 
+const Backend = if (builtin.os.tag == .windows) @import("terminal_windows.zig").Console else PosixTerminal;
 const input = posix.STDIN_FILENO;
 const output = posix.STDOUT_FILENO;
 const sequence_timeout_ms = 50;
@@ -47,8 +48,7 @@ pub const Key = union(enum) {
 };
 
 pub const Terminal = struct {
-    original: posix.termios,
-    original_signals: [exit_signals.len]posix.Sigaction,
+    backend: Backend,
     pending: [8]u8 = undefined,
     pending_start: usize = 0,
     pending_len: usize = 0,
@@ -56,64 +56,19 @@ pub const Terminal = struct {
     at_eof: bool = false,
 
     pub fn init() !Terminal {
-        if (!posix.isatty(input) or !posix.isatty(output)) return error.NotATerminal;
-
-        const original = try posix.tcgetattr(input);
-        var raw = original;
-        raw.iflag = .{};
-        raw.oflag.OPOST = false;
-        raw.cflag.CSIZE = .CS8;
-        raw.cflag.PARENB = false;
-        raw.lflag.ECHO = false;
-        raw.lflag.ECHONL = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.IEXTEN = false;
-        raw.lflag.ISIG = false;
-        raw.cc[@intFromEnum(posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(posix.V.TIME)] = 0;
-        try posix.tcsetattr(input, .FLUSH, raw);
-
-        interrupted.store(false, .monotonic);
-        var terminal: Terminal = .{ .original = original, .original_signals = undefined };
-        const action: posix.Sigaction = .{
-            .handler = .{ .handler = handleSignal },
-            .mask = posix.sigemptyset(),
-            .flags = 0,
-        };
-        for (exit_signals, &terminal.original_signals) |signal, *saved| {
-            posix.sigaction(signal, &action, saved);
-        }
-        return terminal;
+        return .{ .backend = try Backend.init() };
     }
 
     pub fn deinit(self: *const Terminal) void {
-        posix.tcsetattr(input, .FLUSH, self.original) catch {};
-        for (exit_signals, &self.original_signals) |signal, *saved| {
-            posix.sigaction(signal, saved, null);
-        }
+        self.backend.deinit();
     }
 
-    pub fn size(_: *const Terminal) Size {
-        var window: posix.winsize = undefined;
-        const result = if (builtin.os.tag == .linux and !builtin.link_libc)
-            posix.errno(std.os.linux.ioctl(output, posix.T.IOCGWINSZ, @intFromPtr(&window)))
-        else
-            posix.errno(posix.system.ioctl(output, @intCast(posix.T.IOCGWINSZ), &window));
-        if (result != .SUCCESS) return .{ .rows = 24, .cols = 80 };
-
-        return .{
-            .rows = if (window.row == 0) 24 else window.row,
-            .cols = if (window.col == 0) 80 else window.col,
-        };
+    pub fn size(self: *const Terminal) Size {
+        return self.backend.size();
     }
 
-    pub fn writeAll(_: *const Terminal, bytes: []const u8) !void {
-        var remaining = bytes;
-        while (remaining.len != 0) {
-            const written = try posix.write(output, remaining);
-            if (written == 0) return error.EndOfStream;
-            remaining = remaining[written..];
-        }
+    pub fn writeAll(self: *const Terminal, bytes: []const u8) !void {
+        try self.backend.writeAll(bytes);
     }
 
     pub fn readKey(self: *Terminal) !Key {
@@ -121,9 +76,9 @@ pub const Terminal = struct {
     }
 
     pub fn readKeyTimeout(self: *Terminal, timeout_ms: i32) !Key {
-        if (self.at_eof or interrupted.load(.monotonic)) return .eof;
+        if (self.at_eof or Backend.isInterrupted()) return .eof;
         const byte = (try self.readByte(timeout_ms)) orelse {
-            return if (self.at_eof or interrupted.load(.monotonic)) .eof else .tick;
+            return if (self.at_eof or Backend.isInterrupted()) .eof else .tick;
         };
         if (self.pasting) return self.readPaste(byte);
         if (byte == 0x1b) return self.readEscape();
@@ -209,21 +164,98 @@ pub const Terminal = struct {
     }
 
     fn readByte(self: *Terminal, timeout_ms: i32) !?u8 {
-        if (interrupted.load(.monotonic)) return null;
+        if (Backend.isInterrupted()) return null;
         if (self.pending_start < self.pending_len) {
             const byte = self.pending[self.pending_start];
             self.pending_start += 1;
             return byte;
         }
+        return self.backend.readByte(timeout_ms) catch |err| switch (err) {
+            error.EndOfStream => {
+                self.at_eof = true;
+                return null;
+            },
+            else => return err,
+        };
+    }
+};
+
+const PosixTerminal = struct {
+    original: posix.termios,
+    original_signals: [exit_signals.len]posix.Sigaction,
+
+    fn init() !PosixTerminal {
+        if (!posix.isatty(input) or !posix.isatty(output)) return error.NotATerminal;
+
+        const original = try posix.tcgetattr(input);
+        var raw = original;
+        raw.iflag = .{};
+        raw.oflag.OPOST = false;
+        raw.cflag.CSIZE = .CS8;
+        raw.cflag.PARENB = false;
+        raw.lflag.ECHO = false;
+        raw.lflag.ECHONL = false;
+        raw.lflag.ICANON = false;
+        raw.lflag.IEXTEN = false;
+        raw.lflag.ISIG = false;
+        raw.cc[@intFromEnum(posix.V.MIN)] = 1;
+        raw.cc[@intFromEnum(posix.V.TIME)] = 0;
+        try posix.tcsetattr(input, .FLUSH, raw);
+
+        interrupted.store(false, .monotonic);
+        var terminal: PosixTerminal = .{ .original = original, .original_signals = undefined };
+        const action: posix.Sigaction = .{
+            .handler = .{ .handler = handleSignal },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        for (exit_signals, &terminal.original_signals) |signal, *saved| {
+            posix.sigaction(signal, &action, saved);
+        }
+        return terminal;
+    }
+
+    fn deinit(self: *const PosixTerminal) void {
+        posix.tcsetattr(input, .FLUSH, self.original) catch {};
+        for (exit_signals, &self.original_signals) |signal, *saved| {
+            posix.sigaction(signal, saved, null);
+        }
+    }
+
+    fn size(_: *const PosixTerminal) Size {
+        var window: posix.winsize = undefined;
+        const result = if (builtin.os.tag == .linux and !builtin.link_libc)
+            posix.errno(std.os.linux.ioctl(output, posix.T.IOCGWINSZ, @intFromPtr(&window)))
+        else
+            posix.errno(posix.system.ioctl(output, @intCast(posix.T.IOCGWINSZ), &window));
+        if (result != .SUCCESS) return .{ .rows = 24, .cols = 80 };
+
+        return .{
+            .rows = if (window.row == 0) 24 else window.row,
+            .cols = if (window.col == 0) 80 else window.col,
+        };
+    }
+
+    fn writeAll(_: *const PosixTerminal, bytes: []const u8) !void {
+        var remaining = bytes;
+        while (remaining.len != 0) {
+            const written = try posix.write(output, remaining);
+            if (written == 0) return error.EndOfStream;
+            remaining = remaining[written..];
+        }
+    }
+
+    fn isInterrupted() bool {
+        return interrupted.load(.monotonic);
+    }
+
+    fn readByte(_: *PosixTerminal, timeout_ms: i32) !?u8 {
         var fds = [_]posix.pollfd{.{ .fd = input, .events = posix.POLL.IN, .revents = 0 }};
         if (try posix.poll(&fds, timeout_ms) == 0) return null;
         if (interrupted.load(.monotonic)) return null;
 
         var byte: [1]u8 = undefined;
-        if (try posix.read(input, &byte) == 0) {
-            self.at_eof = true;
-            return null;
-        }
+        if (try posix.read(input, &byte) == 0) return error.EndOfStream;
         return byte[0];
     }
 };
@@ -284,7 +316,7 @@ test "Ghostty cursor, editing, and bracketed paste sequences" {
 }
 
 test "pending bytes preserve order when a paste escape is literal" {
-    var terminal: Terminal = .{ .original = undefined, .original_signals = undefined };
+    var terminal: Terminal = .{ .backend = undefined };
     terminal.queue("old");
     terminal.pending_start = 1;
     terminal.queue("new");
@@ -292,7 +324,7 @@ test "pending bytes preserve order when a paste escape is literal" {
 }
 
 test "paste escape sequences stay literal until the exact end marker" {
-    var terminal: Terminal = .{ .original = undefined, .original_signals = undefined, .pasting = true };
+    var terminal: Terminal = .{ .backend = undefined, .pasting = true };
     terminal.queue("[A");
     try std.testing.expectEqual(Key{ .byte = 0x1b }, try terminal.readPaste(0x1b));
     try std.testing.expectEqual(Key{ .byte = '[' }, try terminal.readKey());

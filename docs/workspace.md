@@ -106,11 +106,12 @@ Preserve those edits outside Tome before reopening the changed file.
 Tome replaces each destination independently. Another writer can still change
 the destination after the metadata check.
 
-Saving requires permission to replace the destination in its directory. For
-an existing file, Tome also requires read and write access and retains its basic
-permission bits. Replacement creates a new inode. The new file loses hard-link
-sharing, ownership, ACLs, and extended attributes from the original. If Tome
-opened a symlink, saving updates the resolved target.
+Saving requires permission to replace the destination in its directory. For an
+existing file, Tome also requires read and write access. On macOS and Linux,
+Tome retains the file's basic permission bits. Replacement creates a new file
+identity. The new file loses hard-link sharing, ownership, ACLs, and extended
+attributes from the original. If Tome opened a symlink, saving updates the
+resolved target.
 
 In normal mode, submit `:q` or `:quit` to close the editor. If any file has
 unsaved edits, Tome stays open and reports `Unsaved changes; use :w or :q!`.

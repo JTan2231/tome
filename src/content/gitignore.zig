@@ -1,4 +1,5 @@
 const std = @import("std");
+const files = @import("files.zig");
 const wildmatch = @import("wildmatch.zig");
 
 // Git's limit for ignore files.
@@ -37,13 +38,7 @@ pub const Rules = struct {
     parent: ?*const Rules,
 
     pub fn load(allocator: std.mem.Allocator, dir: std.fs.Dir, prefix: []const u8, parent: ?*const Rules) !?Rules {
-        const fd = std.posix.openat(dir.fd, ".gitignore", .{
-            .ACCMODE = .RDONLY,
-            .CLOEXEC = true,
-            .NOFOLLOW = true,
-            .NONBLOCK = true,
-        }, 0) catch return null;
-        const file = std.fs.File{ .handle = fd };
+        const file = files.openReadNoFollow(dir, ".gitignore") catch return null;
         defer file.close();
         const stat = file.stat() catch return null;
         if (stat.kind != .file or stat.size > max_file_size) return null;
